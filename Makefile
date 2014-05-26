@@ -55,7 +55,7 @@ endif
 #
 
 # Define project name here
-PROJECT = receiver
+PROJECT = rserver
 
 # Imported source files and paths
 CHIBIOS = ../chibios/ChibiOS_2.6.0
