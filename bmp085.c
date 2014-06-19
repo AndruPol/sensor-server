@@ -245,7 +245,7 @@ void bmp085_init(void) {
 }
 
 #define BMP085_WAIT_MS		100
-int bmp085_read(int16_t *temperature, uint32_t *pressure, bmp085_error_t *error) {
+bmp085_error_t bmp085_read(int16_t *temperature, uint32_t *pressure) {
 	bmp085_read_t rd;
 	bmp085_read_t *rd_p = &rd;
 
@@ -255,18 +255,16 @@ int bmp085_read(int16_t *temperature, uint32_t *pressure, bmp085_error_t *error)
 
 	/* wait for reply */
 	if(chBSemWaitTimeout(&bmp085sem, MS2ST(BMP085_WAIT_MS)) == RDY_TIMEOUT) {
-		*error = BMP085_TIMEOUT;
-		return -1;
+		return BMP085_TIMEOUT;
 	}
 	chBSemReset(&bmp085sem, FALSE);
 
 	if(rd.error != BMP085_NO_ERROR) {
-		*error = rd.error;
-		return -1;
+		return rd.error;
 	}
 
     // calculate temp & press
     bmp085_calculate(temperature, pressure);
 
-	return 0;
+	return BMP085_NO_ERROR;
 }

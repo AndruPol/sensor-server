@@ -79,12 +79,11 @@ CSRC = $(PORTSRC) \
        $(CHIBIOS)/os/various/syscalls.c \
        $(CHIBIOS)/os/various/shell.c \
        $(CHIBIOS)/os/various/chprintf.c \
+       util/printfs.c util/itoa.c util/utoa.c util/floatp10.c \
        bmp085.c \
        nrf_spi.c nrf24l01.c \
        usb_serial.c \
        main.c
-
-#       $(FATFSSRC) \
 
 # C++ sources that can be compiled in ARM or THUMB mode depending on the global
 # setting.

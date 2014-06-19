@@ -526,7 +526,6 @@
 /* Port-specific settings (override port settings defaulted in chcore.h).    */
 /*===========================================================================*/
 #define PORT_INT_REQUIRED_STACK 			32
-#define CHPRINTF_USE_FLOAT					1
 
 #endif  /* _CHCONF_H_ */
 
