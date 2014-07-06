@@ -18,18 +18,40 @@ extern "C" {
 #define MSGSIZE				16		// message data size
 #define MSGDUPTIME			30		// duplicate message timeout, s
 
+typedef enum {
+	SENSOR_INFO = 0,	// not implemented
+	SENSOR_DATA,
+	SENSOR_ERROR
+} msgtype_t;
+
+typedef enum {
+	DS1820 = 0,	// not implemented
+	BH1750,
+	DHT,
+	BMP085,
+	ADC
+} sensortype_t;
+
+typedef enum {
+	TEMPERATURE = 0,	// not implemented
+	HUMIDITY,
+	PRESSURE,
+	LIGHT,
+	VOLTAGE
+} valuetype_t;
+
 // message format
 typedef struct MESSAGE MESSAGE_T;
 struct MESSAGE{
-	uint8_t msgType;	// message type: 0 - info, 1 - sensor value, 2 - sensor error
-	uint8_t sensorID;	// remote sensor ID
-	uint8_t sensorType;	// sensor type: 0 - 1-wire, 1 - BH1750, 2 - DHT сенсор, 3 - BMP085
-	uint8_t valueType;	// value type: 0 - temperature, 1 - humidity, 2 - pressure
-	uint8_t owkey[8];	// sensor id for 1-wire, sensor number for DHT in owkey[0]
-	union	{			// sensor value depend of sensor type
+	msgtype_t msgType;			// message type: 0 - info, 1 - sensor value, 2 - sensor error
+	uint8_t sensorID;			// remote sensor ID
+	sensortype_t sensorType;	// sensor type: 0 - 1-wire, 1 - BH1750, 2 - DHT сенсор, 3 - BMP085
+	valuetype_t valueType;		// value type: 0 - temperature, 1 - humidity, 2 - pressure
+	uint8_t owkey[8];			// sensor id for 1-wire, sensor number for DHT in owkey[0]
+	union	{					// sensor value depend of sensor type
 		float	fValue;
 		int32_t	iValue;
-		uint8_t ch[4];
+		uint8_t cValue[4];
 	} data;
 };
 

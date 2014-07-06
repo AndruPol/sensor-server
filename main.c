@@ -27,8 +27,17 @@
 #include "util/printfs.h"
 #include "shell.h"
 
+#define AES				1	// decrypt received data
+
+#if AES
+#include "aes/inc/aes.h"
+#include "aes/inc/aes_user_options.h"
+#include "aes_secret.h"
+static aes_data_t aes_data;
+#endif
+
 #define ARRAY_LEN(a) (sizeof(a)/sizeof(a[0]))
-//#define USE_SHELL		1		// ChibiOS shell use
+#define USE_SHELL		0		// ChibiOS shell use
 
 static VirtualTimer delayTimer;
 static BinarySemaphore mainsem, putsem;
@@ -79,13 +88,15 @@ bool_t msgReceived(MESSAGE_T *msg) {
 		}
 	}
 	if (idx == MAXSENSORS) { // add message time to msgtrace
-		idx = msgtrace.count;
-		msgtrace.msgtm[idx].sensorID = msg->sensorID;
-		msgtrace.msgtm[idx].sensorType = msg->sensorType;
-		msgtrace.msgtm[idx].valueType = msg->valueType;
-		msgtrace.msgtm[idx].owkey0 = msg->owkey[0];
-		msgtrace.msgtm[idx].sysTime = chTimeNow();
-		msgtrace.count = idx+1;
+		if (msgtrace.count < MAXSENSORS) {
+			idx = msgtrace.count;
+			msgtrace.msgtm[idx].sensorID = msg->sensorID;
+			msgtrace.msgtm[idx].sensorType = msg->sensorType;
+			msgtrace.msgtm[idx].valueType = msg->valueType;
+			msgtrace.msgtm[idx].owkey0 = msg->owkey[0];
+			msgtrace.msgtm[idx].sysTime = chTimeNow();
+			msgtrace.count = idx+1;
+		}
 		return FALSE;
 	}
 	if ((chTimeNow() - msgtrace.msgtm[idx].sysTime) < S2ST(MSGDUPTIME)) {
@@ -254,6 +265,27 @@ static msg_t nrfSendThread(void *arg) {
   }
 }
 
+bool_t get_sensor_type(const sensortype_t type, char *line) {
+	  switch (type) {
+	  case DS1820:
+		  memcpy(line,"DS1820",6);
+		  return TRUE;
+	  case BH1750:
+		  memcpy(line,"BH1750",6);
+		  return TRUE;
+	  case DHT:
+		  memcpy(line,"DHT",3);
+		  return TRUE;
+	  case BMP085:
+		  memcpy(line,"BMP085",6);
+		  return TRUE;
+	  case ADC:
+		  memcpy(line,"ADC",3);
+		  return TRUE;
+	  }
+	  return FALSE;
+}
+
 static WORKING_AREA(waNRFReceiveThread,1024);
 __attribute__((noreturn))
 static msg_t nrfReceiveThread(void *arg) {
@@ -263,14 +295,24 @@ static msg_t nrfReceiveThread(void *arg) {
 
   static uint8_t pipeNr=0;
   static uint8_t inBuf[17]={0};
+#if AES
+  static uint8_t mBuf[16];
+#endif
   static uint8_t owkey[17];
-  static char line[60];
+  static char line[60], stype[7];
+
 
   while (TRUE) {
 	  chBSemWait(&nrfsem);
 	  NRFReceiveData(&pipeNr, inBuf);
-	  MESSAGE_T *msg = (MESSAGE_T *)inBuf;
 	  chBSemSignal(&nrfsem);
+#if AES
+	  aes_decrypt_ecb(&aes_data, inBuf, mBuf);
+	  MESSAGE_T *msg = (MESSAGE_T *)mBuf;
+#else
+	  MESSAGE_T *msg = (MESSAGE_T *)inBuf;
+#endif
+
 #if 0	// TODO: send answer to client
 	  chMsgSend(nrfSendThread_p, (msg_t) msg);
 
@@ -281,75 +323,58 @@ static msg_t nrfReceiveThread(void *arg) {
 #endif
 	  if (msgReceived(msg)) continue;
 	  switch (msg->msgType) {
-	  case 1:
+	  case SENSOR_DATA:	//SENSOR
 		  switch (msg->sensorType) {
-		  case 0:
+		  case DS1820:
 			  owkey_hexstr(msg->owkey, owkey);
 			  sprintf(line,"SENSOR:%d:DS1820:%s:TEMPERATURE:%.2f", msg->sensorID, owkey, (float)msg->data.fValue);
 			  serialPutLine(line);
 			  break;
-		  case 1:
+		  case BH1750:
 			  sprintf(line,"SENSOR:%d:BH1750:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
 			  serialPutLine(line);
 			  break;
-		  case 2:
-			  if (msg->valueType == 0){
+		  case DHT:
+			  if (msg->valueType == TEMPERATURE){
 				  sprintf(line,"SENSOR:%d:DHT:%d:TEMPERATURE:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
 				  serialPutLine(line);
 			  }
-			  if (msg->valueType == 1){
+			  if (msg->valueType == HUMIDITY){
 				  sprintf(line,"SENSOR:%d:DHT:%d:HUMIDITY:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
 				  serialPutLine(line);
 			  }
 			  break;
-		  case 3:
-			  if (msg->valueType == 0){
+		  case BMP085:
+			  if (msg->valueType == TEMPERATURE){
 				  sprintf(line,"SENSOR:%d:BMP085:1:TEMPERATURE:%.2f", msg->sensorID, (float)msg->data.fValue/10);
 				  serialPutLine(line);
 			  }
-			  if (msg->valueType == 2){
+			  if (msg->valueType == PRESSURE){
 				  sprintf(line,"SENSOR:%d:BMP085:1:PRESSURE:%.2f", msg->sensorID, (float)msg->data.fValue*75/10000);
 				  serialPutLine(line);
 			  }
 			  break;
-		  case 4:
-			  if (msg->valueType == 3){
+		  case ADC:
+			  if (msg->valueType == LIGHT){
 				  sprintf(line,"SENSOR:%d:ADC:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
 				  serialPutLine(line);
 			  }
-			  if (msg->valueType == 4){
+			  if (msg->valueType == VOLTAGE){
 				  sprintf(line,"SENSOR:%d:ADC:1:VOLTAGE:%d", msg->sensorID, (int)msg->data.iValue);
 				  serialPutLine(line);
 			  }
 			  break;
-		  default:
+		  default:	//UNKNOWN
 			  sprintf(line,"SENSOR:%d:ERROR:unknown sensor type", msg->sensorID);
 			  serialPutLine(line);
 			  break;
 		  }
 		  break;
-	  case 2:
-		  switch (msg->sensorType) {
-		  case 0:
-			  sprintf(line,"ERROR:%d:DS1820", msg->sensorID);
+	  case SENSOR_ERROR:
+		  memset(&stype,0,7);
+		  if (get_sensor_type(msg->sensorType, stype)) {
+			  sprintf(line,"ERROR:%d:%s:%d:%d", msg->sensorID, stype, msg->owkey[0], msg->data.cValue[0]);
 			  serialPutLine(line);
-			  break;
-		  case 1:
-			  sprintf(line,"ERROR:%d:BH1750", msg->sensorID);
-			  serialPutLine(line);
-			  break;
-		  case 2:
-			  sprintf(line,"ERROR:%d:DHT:%d", msg->sensorID, msg->owkey[0]);
-			  serialPutLine(line);
-			  break;
-		  case 3:
-			  sprintf(line,"ERROR:%d:BMP085", msg->sensorID);
-			  serialPutLine(line);
-			  break;
-		  case 4:
-			  sprintf(line,"ERROR:%d:ADC", msg->sensorID);
-			  serialPutLine(line);
-			  break;
 		  }
 		  break;
 	  default:
@@ -434,6 +459,10 @@ int main(void) {
   addr_hexstr(txaddr, txaddrstr);
   sprintf(line,"CHANNEL: %d, TX ADDR:%s, RX ADDR:%s", CHANNEL, txaddrstr, rxaddrstr);
   serialPutLine(line);
+
+#if AES
+  aes_initialize(&aes_data, AES_KEY_LENGTH_128_BITS, aes_key, NULL);
+#endif
 
   chBSemInit(&nrfsem, FALSE);
 

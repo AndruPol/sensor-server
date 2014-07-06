@@ -5,7 +5,7 @@
 
 # Compiler options here.
 ifeq ($(USE_OPT),)
-  USE_OPT = -O0 -std=gnu99 -ggdb -fomit-frame-pointer -falign-functions=16
+  USE_OPT = -O2 -std=gnu99 -ggdb -fomit-frame-pointer -falign-functions=16
 endif
 
 # C specific options here (added to USE_OPT).
@@ -30,7 +30,7 @@ endif
 
 # Enable this if you want to see the full log while compiling.
 ifeq ($(USE_VERBOSE_COMPILE),)
-  USE_VERBOSE_COMPILE = no
+  USE_VERBOSE_COMPILE = yes
 endif
 
 #
@@ -58,12 +58,13 @@ endif
 PROJECT = rserver
 
 # Imported source files and paths
-CHIBIOS = ../chibios/ChibiOS_2.6.0
+CHIBIOS = ../chibios/ChibiOS_2.6.4
 include UET_STM32_F103/board.mk
 include $(CHIBIOS)/os/hal/platforms/STM32F1xx/platform.mk
 include $(CHIBIOS)/os/hal/hal.mk
 include $(CHIBIOS)/os/ports/GCC/ARMCMx/STM32F1xx/port.mk
 include $(CHIBIOS)/os/kernel/kernel.mk
+include aes/aes.mk
 
 # Define linker script file here
 LDSCRIPT= STM32F103xE.ld
@@ -79,6 +80,7 @@ CSRC = $(PORTSRC) \
        $(CHIBIOS)/os/various/syscalls.c \
        $(CHIBIOS)/os/various/shell.c \
        $(CHIBIOS)/os/various/chprintf.c \
+       $(AESSRC) \
        util/printfs.c util/itoa.c util/utoa.c util/floatp10.c \
        bmp085.c \
        nrf_spi.c nrf24l01.c \
@@ -114,7 +116,7 @@ ASMSRC = $(PORTASM)
 
 INCDIR = $(PORTINC) $(KERNINC) \
          $(HALINC) $(PLATFORMINC) $(BOARDINC) \
-         $(CHIBIOS)/os/various
+         $(CHIBIOS)/os/various $(AESINC)
 
 #
 # Project, sources and paths
