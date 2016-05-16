@@ -7,3 +7,4 @@ build/obj
 build/rserver.hex
 build/rserver.dmp
 build/rserver.map
+aes_secret.h

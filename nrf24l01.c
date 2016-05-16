@@ -34,8 +34,12 @@
 #include "nrf_spi.h"
 #include "nrf24l01.h"
 
-#define NRF_TRANSMIT_TIMEOUT_MS		5
-static uint8_t sendAddr[5]={0xAE,0xAE,0xAE,0xAE,0x01};
+#define NRF_WA_SIZE					256
+#define NRF_PRIO					(NORMALPRIO+2)
+
+#define NRF_TRANSMIT_TIMEOUT_MS		3
+static uint8_t sendAddr[5] = {0xAE, 0xAE, 0xAE, 0xAE, 0x01};
+
 NRFD nrf;
 
 /*
@@ -547,11 +551,6 @@ void NRFReceiveData(uint8_t *pipeNr, uint8_t *inBuf)
 	nrf.rxstate = NRF_RX_ACTIVE;
 
 	/*
-	 * Wait for binary semaphore NRFSemRX
-	 */
-	chBSemWait(&nrf.NRFSemRX);
-
-	/*
 	 * Bring CE down, in order to execute the read operation
 	 */
 	NRFSetCE(low);
@@ -600,12 +599,13 @@ bool_t NRFSendData(uint8_t *outBuf)
 
 	if (nrf.txstate == NRF_TX_IDLE){
 		nrf.rxstate = NRF_RX_IDLE;
+
 		/*
 		 * Set PRIM_RX register.
 		 */
 		NRFSetPrimRx(prim_tx);
-
 	}
+
 	nrf.txstate = NRF_TX_ACTIVE;
 
 	/*
@@ -625,8 +625,8 @@ bool_t NRFSendData(uint8_t *outBuf)
 	NRFSetCE(high);
 
 	chThdSleepMicroseconds(NRF_TRANSMIT_TIMEOUT_MS);
-	bool_t ret = (nrf.flags == NRF_TX_NO_ERROR);
-			//&& nrf.txstate == NRF_TX_COMPLETE);
+	bool_t ret = (nrf.flags == NRF_TX_NO_ERROR && nrf.txstate == NRF_TX_COMPLETE);
+
 	/*
 	 * Set PRIM_RX register.
 	 */
@@ -720,6 +720,19 @@ static void NRFFlushRX(void)
 }
 
 /*
+ * NRF thread
+ */
+static WORKING_AREA(nrfIRQThreadWA, NRF_WA_SIZE);
+__attribute__((noreturn))
+static msg_t nrfIRQThread(void *arg) {
+	(void)arg;
+	chRegSetThreadName("nrfIRQThd");
+	while (TRUE) {
+		NRFHandleIrq();
+	}
+}
+
+/*
  * Initialize the NRF24L01 chip
  */
 void NRFInit(void)
@@ -800,7 +813,7 @@ void NRFInit(void)
 	/*
 	 * Creates the NRF24L01+ thread.
 	 */
-	chThdCreateStatic(NRFThreadWA, sizeof(NRFThreadWA), HIGHPRIO, NRFThread, NULL);
+	chThdCreateStatic(nrfIRQThreadWA, sizeof(nrfIRQThreadWA), NRF_PRIO, nrfIRQThread, NULL);
 
 	/*
 	 * Interrupts are handled from this point on.
@@ -892,18 +905,6 @@ uint8_t NRFChannelScan(uint8_t chan){
 	return carr;
 }
 
-/*
- * NRF thread
- */
-WORKING_AREA(NRFThreadWA, NRF_WA_SIZE);
-__attribute__((noreturn))
-msg_t NRFThread(void *arg) {
-	chRegSetThreadName("NRFThread");
-	(void)arg;
-	while (TRUE) {
-		NRFHandleIrq();
-	}
-}
 
 #if 0
 /*

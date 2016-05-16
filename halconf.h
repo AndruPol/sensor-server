@@ -34,7 +34,7 @@
  * @brief   Enables the TM subsystem.
  */
 #if !defined(HAL_USE_TM) || defined(__DOXYGEN__)
-#define HAL_USE_TM                  FALSE
+#define HAL_USE_TM                  TRUE
 #endif
 
 /**
@@ -69,7 +69,7 @@
  * @brief   Enables the GPT subsystem.
  */
 #if !defined(HAL_USE_GPT) || defined(__DOXYGEN__)
-#define HAL_USE_GPT                 FALSE
+#define HAL_USE_GPT                 TRUE
 #endif
 
 /**
@@ -111,7 +111,7 @@
  * @brief   Enables the RTC subsystem.
  */
 #if !defined(HAL_USE_RTC) || defined(__DOXYGEN__)
-#define HAL_USE_RTC                 TRUE
+#define HAL_USE_RTC                 FALSE
 #endif
 
 /**
@@ -125,14 +125,14 @@
  * @brief   Enables the SERIAL subsystem.
  */
 #if !defined(HAL_USE_SERIAL) || defined(__DOXYGEN__)
-#define HAL_USE_SERIAL              FALSE
+#define HAL_USE_SERIAL              TRUE
 #endif
 
 /**
  * @brief   Enables the SERIAL over USB subsystem.
  */
 #if !defined(HAL_USE_SERIAL_USB) || defined(__DOXYGEN__)
-#define HAL_USE_SERIAL_USB          TRUE
+#define HAL_USE_SERIAL_USB          FALSE
 #endif
 
 /**
@@ -146,14 +146,14 @@
  * @brief   Enables the UART subsystem.
  */
 #if !defined(HAL_USE_UART) || defined(__DOXYGEN__)
-#define HAL_USE_UART                FALSE
+#define HAL_USE_UART                TRUE
 #endif
 
 /**
  * @brief   Enables the USB subsystem.
  */
 #if !defined(HAL_USE_USB) || defined(__DOXYGEN__)
-#define HAL_USE_USB                 TRUE
+#define HAL_USE_USB                 FALSE
 #endif
 
 /*===========================================================================*/
@@ -317,7 +317,7 @@
  *          buffers.
  */
 #if !defined(SERIAL_BUFFERS_SIZE) || defined(__DOXYGEN__)
-#define SERIAL_BUFFERS_SIZE         16
+#define SERIAL_BUFFERS_SIZE         64
 #endif
 
 /*===========================================================================*/

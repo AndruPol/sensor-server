@@ -17,17 +17,33 @@
 #include "ch.h"
 #include "hal.h"
 #include "chprintf.h"
-#include "evtimer.h"
-#include "chrtclib.h"
 
 #include "main.h"
-#include "usb_serial.h"
 #include "nrf24l01.h"
 #include "bmp085.h"
 #include "util/printfs.h"
-#include "shell.h"
 
-#define AES				1	// decrypt received data
+#include <string.h>
+
+#define FIRMWARE			101		// версия прошивки
+#define BMP085_POLL_S		900		// интервал таймера опроса датчика BMP085, сек
+#define BMP085_TRYCNT		3		// max попыток чтения датчика BMP085
+
+/* ----------------------- Modbus includes ----------------------------------*/
+#include "modbus_slave.h"
+
+#define LED_GPIO			GPIOC
+#define LED_PIN				13
+
+#define USE_SHELL			0		// ChibiOS shell use
+#if USE_SHELL
+#include "evtimer.h"
+#include "chrtclib.h"
+#include "shell.h"
+#endif
+
+#define AES					1		// decrypt received data
+#define DEBUG				0
 
 #if AES
 #include "aes/inc/aes.h"
@@ -36,15 +52,21 @@
 static aes_data_t aes_data;
 #endif
 
-#define ARRAY_LEN(a) (sizeof(a)/sizeof(a[0]))
-#define USE_SHELL		0		// ChibiOS shell use
+static VirtualTimer bmp085Timer;
+static BinarySemaphore bmp085sem;
 
-static VirtualTimer delayTimer;
-static BinarySemaphore mainsem, putsem;
+static BinarySemaphore mcusem;
 static MESSAGE_TRACE_T msgtrace = {0};
 
+#define NRF_READ_BUFFERS	6
+static MESSAGE_T nrf_read_buf[NRF_READ_BUFFERS];
+static MESSAGE_T *read_free[NRF_READ_BUFFERS];
+static MESSAGE_T *read_fill[NRF_READ_BUFFERS];
+static MAILBOX_DECL(mb_read_free, (msg_t*) read_free, NRF_READ_BUFFERS);
+static MAILBOX_DECL(mb_read_fill, (msg_t*) read_fill, NRF_READ_BUFFERS);
+
 // convert nrf24l01 5 bytes address to char[11]
-void addr_hexstr(uint8_t *addr, uint8_t *str){
+static void addr_hexstr(uint8_t *addr, uint8_t *str){
     uint8_t *pin = addr;
     const char *hex = "0123456789ABCDEF";
     uint8_t *pout = str;
@@ -55,29 +77,14 @@ void addr_hexstr(uint8_t *addr, uint8_t *str){
     *pout = 0;
 }
 
-// convert 1-wire 8 bytes address to char[17]
-void owkey_hexstr(uint8_t *addr, uint8_t *str){
-    uint8_t *pin = addr;
-    const char *hex = "0123456789ABCDEF";
-    uint8_t *pout = str;
-    for(uint8_t i=0; i < 8; i++){
-        *pout++ = hex[(*pin>>4)&0xF];
-        *pout++ = hex[(*pin++)&0xF];
-    }
-    *pout = 0;
-}
-
-// put line over serial port
-void serialPutLine(const char *line) {
-	if (SDU1.config->usbp->state == USB_ACTIVE) {
-		chBSemWait(&putsem);
-		chprintf((BaseSequentialStream *)&SDU1,"%s\r\n", line);
-		chBSemSignal(&putsem);
-	}
+void pcPutLine(const char *line) {
+	chBSemWait(&mcusem);
+	chprintf((BaseSequentialStream *)&SD2,"%s\r\n", line);
+	chBSemSignal(&mcusem);
 }
 
 // check received message for duplicate
-bool_t msgReceived(MESSAGE_T *msg) {
+static bool_t msgReceived(MESSAGE_T *msg) {
 	uint8_t idx = MAXSENSORS;
 	// search received message in msgtrace
 	for (uint8_t i=0; i < msgtrace.count; i++) {
@@ -105,15 +112,6 @@ bool_t msgReceived(MESSAGE_T *msg) {
 	}
 	msgtrace.msgtm[idx].sysTime = chTimeNow();
 	return FALSE;
-}
-
-// delayTimer callback
-void delayTimer_handler(void *arg){
-	(void)arg;
-	chSysLockFromIsr();
-	chBSemSignalI(&mainsem);
-	chVTSetI(&delayTimer, MS2ST(BMP085_DELAY_MS), delayTimer_handler, 0);
-	chSysUnlockFromIsr();
 }
 
 /*
@@ -153,6 +151,11 @@ static const EXTConfig extcfg = {
     {EXT_CH_MODE_DISABLED, NULL},
   }
 };
+
+void system_reset(void) {
+  chThdSleepMilliseconds(100);
+  NVIC_SystemReset();
+}
 
 #if USE_SHELL
 /*===========================================================================*/
@@ -215,7 +218,7 @@ static const ShellCommand commands[] = {
 };
 
 static const ShellConfig shell_cfg = {
-  (BaseSequentialStream *)&SDU1,
+  (BaseSequentialStream *)&SD2,
   commands
 };
 #endif	//USE_SHELL
@@ -224,21 +227,58 @@ static const ShellConfig shell_cfg = {
 /* Main and generic code.                                                    */
 /*===========================================================================*/
 
-/*
- * Red LEDs blinker thread, times are in milliseconds.
- */
-static WORKING_AREA(waBlinkerThread, 128);
-__attribute__((noreturn))
-static msg_t blinkerThread(void *arg) {
+// BMP085 polling timer callback
+static void bmp085Timer_handler(void *arg){
+	(void)arg;
+	chSysLockFromIsr();
+	chBSemSignalI(&bmp085sem);
+	chVTSetI(&bmp085Timer, S2ST(BMP085_POLL_S), bmp085Timer_handler, 0);
+	chSysUnlockFromIsr();
+}
 
+/*
+ * BMP085 polling thread
+ */
+static WORKING_AREA(waBMP085Thread, 256);
+__attribute__((noreturn))
+static msg_t BMP085Thread(void *arg) {
   (void)arg;
-  chRegSetThreadName("blinkerThd");
+  chRegSetThreadName("BMP085Thd");
   while (TRUE) {
-    palTogglePad(GPIOC, GPIOC_LED);
-    chThdSleepMilliseconds(500);
+    chBSemWait(&bmp085sem);
+
+    int16_t temperature;
+    uint32_t pressure;
+    uint8_t readcnt = BMP085_TRYCNT;
+    while (readcnt-- > 0) {
+    	if (bmp085_read(&temperature, &pressure) == BMP085_OK) {
+#if DEBUG
+    		sprintf(line,"SENSOR:0:BMP085:1:TEMPERATURE:%.2f", (float)temperature/10);
+    		pcPutLine(line);
+#endif
+    		writeInputReg(BMP085_TEMPERATURE, (float)temperature);
+#if DEBUG
+    		sprintf(line,"SENSOR:0:BMP085:1:PRESSURE:%.2f", (float)pressure*75/10000);
+    		pcPutLine(line);
+#endif
+    		writeInputReg(BMP085_PRESSURE, (float)pressure*75/1000);
+        	break;
+    }
+    else {
+#if DEBUG
+    		sprintf(line,"ERROR:0:BMP085");
+    		pcPutLine(line);
+#endif
+    		setReceivedBit(BMP085_TEMPERATURE, 1);
+    		setErrorBit(BMP085_TEMPERATURE, 1);
+    		setReceivedBit(BMP085_PRESSURE, 1);
+    		setErrorBit(BMP085_PRESSURE, 1);
+    	}
+    }
   }
 }
 
+#if 0
 #define SEND_TIMEOUT		2000
 static BinarySemaphore nrfsem;
 
@@ -264,54 +304,23 @@ static msg_t nrfSendThread(void *arg) {
 	chBSemSignal(&nrfsem);
   }
 }
+#endif
 
-bool_t get_sensor_type(const sensortype_t type, char *line) {
-	  switch (type) {
-	  case DS1820:
-		  memcpy(line,"DS1820",6);
-		  return TRUE;
-	  case BH1750:
-		  memcpy(line,"BH1750",6);
-		  return TRUE;
-	  case DHT:
-		  memcpy(line,"DHT",3);
-		  return TRUE;
-	  case BMP085:
-		  memcpy(line,"BMP085",6);
-		  return TRUE;
-	  case ADC:
-		  memcpy(line,"ADC",3);
-		  return TRUE;
-	  }
-	  return FALSE;
-}
-
-static WORKING_AREA(waNRFReceiveThread,1024);
+static WORKING_AREA(waNRFReceiveThread, 256);
 __attribute__((noreturn))
 static msg_t nrfReceiveThread(void *arg) {
-
   (void)arg;
   chRegSetThreadName("nrfReceive");
 
-  static uint8_t pipeNr=0;
-  static uint8_t inBuf[17]={0};
-#if AES
-  static uint8_t mBuf[16];
-#endif
-  static uint8_t owkey[17];
-  static char line[60], stype[7];
+  uint8_t pipeNr=0;
 
+  for (uint8_t i=0; i < NRF_READ_BUFFERS; i++)
+	  chMBPost(&mb_read_free, (msg_t) &nrf_read_buf[i], TIME_IMMEDIATE);
 
   while (TRUE) {
-	  chBSemWait(&nrfsem);
-	  NRFReceiveData(&pipeNr, inBuf);
-	  chBSemSignal(&nrfsem);
-#if AES
-	  aes_decrypt_ecb(&aes_data, inBuf, mBuf);
-	  MESSAGE_T *msg = (MESSAGE_T *)mBuf;
-#else
-	  MESSAGE_T *msg = (MESSAGE_T *)inBuf;
-#endif
+	  chBSemWait(&nrf.NRFSemRX);
+	  uint8_t inbuf[sizeof(MESSAGE_T)+1] = {0};
+	  NRFReceiveData(&pipeNr, inbuf);
 
 #if 0	// TODO: send answer to client
 	  chMsgSend(nrfSendThread_p, (msg_t) msg);
@@ -321,65 +330,155 @@ static msg_t nrfReceiveThread(void *arg) {
 		  chBSemReset(&nrfsem, FALSE);
 	  }
 #endif
+
+	  void *pbuf;
+	  if (chMBFetch(&mb_read_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == RDY_OK) {
+		  memcpy(pbuf, inbuf, sizeof(MESSAGE_T));
+		  chMBPost(&mb_read_fill, (msg_t) pbuf, TIME_IMMEDIATE);
+	  }
+
+  }
+}
+
+static WORKING_AREA(waNRFParseThread, 256);
+__attribute__((noreturn))
+static msg_t nrfParseThread(void *arg) {
+  (void)arg;
+  chRegSetThreadName("nrfParse");
+
+#if AES
+  uint8_t mbuf[16];
+#endif
+
+#if DEBUG
+  char line[60], stype[7];
+  char owkey[17];
+#endif
+
+  while (TRUE) {
+	  void *pbuf;
+	  if (chMBFetch(&mb_read_fill, (msg_t *) &pbuf, TIME_INFINITE) == RDY_OK) {
+	     chMBPost(&mb_read_free, (msg_t) pbuf, TIME_IMMEDIATE);
+	  } else {
+		  continue;
+	  }
+
+	  MESSAGE_T *msg = (MESSAGE_T *)pbuf;
+
+#if AES
+	  aes_decrypt_ecb(&aes_data, pbuf, mbuf);
+	  msg = (MESSAGE_T *)mbuf;
+#endif
+
+#if 0
 	  if (msgReceived(msg)) continue;
+#endif
+
 	  switch (msg->msgType) {
 	  case SENSOR_DATA:	//SENSOR
 		  switch (msg->sensorType) {
 		  case DS1820:
+#if DEBUG
 			  owkey_hexstr(msg->owkey, owkey);
 			  sprintf(line,"SENSOR:%d:DS1820:%s:TEMPERATURE:%.2f", msg->sensorID, owkey, (float)msg->data.fValue);
-			  serialPutLine(line);
+			  pcPutLine(line);
+#endif
+			  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, (float)msg->data.fValue * 10);
 			  break;
 		  case BH1750:
+#if DEBUG
 			  sprintf(line,"SENSOR:%d:BH1750:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
-			  serialPutLine(line);
+			  pcPutLine(line);
+#endif
+			  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, (float)msg->data.iValue * 10);
 			  break;
 		  case DHT:
 			  if (msg->valueType == TEMPERATURE){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:DHT:%d:TEMPERATURE:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
-				  serialPutLine(line);
-			  }
-			  if (msg->valueType == HUMIDITY){
+				  pcPutLine(line);
+#endif
+				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, (float)msg->data.iValue);
+			  } else if (msg->valueType == HUMIDITY){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:DHT:%d:HUMIDITY:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
-				  serialPutLine(line);
+				  pcPutLine(line);
+#endif
+				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, (float)msg->data.iValue);
 			  }
 			  break;
 		  case BMP085:
 			  if (msg->valueType == TEMPERATURE){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:BMP085:1:TEMPERATURE:%.2f", msg->sensorID, (float)msg->data.fValue/10);
-				  serialPutLine(line);
-			  }
-			  if (msg->valueType == PRESSURE){
+				  pcPutLine(line);
+#endif
+			  } else if (msg->valueType == PRESSURE){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:BMP085:1:PRESSURE:%.2f", msg->sensorID, (float)msg->data.fValue*75/10000);
-				  serialPutLine(line);
+				  pcPutLine(line);
+#endif
 			  }
 			  break;
 		  case ADC:
 			  if (msg->valueType == LIGHT){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:ADC:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
-				  serialPutLine(line);
-			  }
-			  if (msg->valueType == VOLTAGE){
+				  pcPutLine(line);
+#endif
+				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, (float)msg->data.iValue * 10);
+			  } else if (msg->valueType == VOLTAGE){
+#if DEBUG
 				  sprintf(line,"SENSOR:%d:ADC:1:VOLTAGE:%d", msg->sensorID, (int)msg->data.iValue);
-				  serialPutLine(line);
+				  pcPutLine(line);
+#endif
 			  }
 			  break;
 		  default:	//UNKNOWN
+#if DEBUG
 			  sprintf(line,"SENSOR:%d:ERROR:unknown sensor type", msg->sensorID);
-			  serialPutLine(line);
+			  pcPutLine(line);
+#endif
 			  break;
 		  }
 		  break;
 	  case SENSOR_ERROR:
+		  switch (msg->sensorType) {
+		  case DS1820:
+			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, 1);
+			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, 1);
+			  break;
+		  case BH1750:
+			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
+			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
+			  break;
+		  case DHT:
+			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, 1);
+			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, 1);
+			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, 1);
+			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, 1);
+			  break;
+		  case ADC:
+			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
+			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
+			  break;
+		  default:
+			  break;
+		  }
+#if DEBUG
 		  memset(&stype,0,7);
 		  if (get_sensor_type(msg->sensorType, stype)) {
 			  sprintf(line,"ERROR:%d:%s:%d:%d", msg->sensorID, stype, msg->owkey[0], msg->data.cValue[0]);
-			  serialPutLine(line);
+			  pcPutLine(line);
 		  }
+#endif
 		  break;
 	  default:
+#if DEBUG
 		  sprintf(line,"ERROR:%d:unknown message type", msg->sensorID);
-		  serialPutLine(line);
+		  pcPutLine(line);
+#endif
+		  break;
 	  }
   } // while
 }
@@ -387,7 +486,8 @@ static msg_t nrfReceiveThread(void *arg) {
 // called on kernel panic
 void port_halt(void){
 	port_disable();
-	palSetPad(GPIOC, GPIOC_LED); // turn on error
+	palClearPad(GPIOA, GPIOA_PIN8); 	// release RS485 TX_EN pin
+	palSetPad(LED_GPIO, LED_PIN); 		// LED turn on error
 	while(TRUE)
 	{
 	}
@@ -407,26 +507,17 @@ int main(void) {
   halInit();
   chSysInit();
 
-  /*
-   * Initializes a serial-over-USB CDC driver.
-   */
-  sduObjectInit(&SDU1);
-  sduStart(&SDU1, &serusbcfg);
+#if DEBUG
+  // serial port for slave MCU read/write
+  sdStart(&SD2, NULL);
+  palSetPadMode(GPIOA, GPIOA_PIN2, PAL_MODE_STM32_ALTERNATE_PUSHPULL);
+  palSetPadMode(GPIOA, GPIOA_PIN3, PAL_MODE_INPUT);
+  chBSemInit(&mcusem, FALSE);
 
-  /*
-   * Activates the USB driver and then the USB bus pull-up on D+.
-   * Note, a delay is inserted in order to not have to disconnect the cable
-   * after a reset.
-   */
-  usbDisconnectBus(serusbcfg.usbp);
-  chThdSleepMilliseconds(1500);
-  usbConnectBus(serusbcfg.usbp);
-  usbStart(serusbcfg.usbp, &usbcfg);
-
-  chBSemInit(&putsem, FALSE);
-  static char line[60];
-  sprintf(line, "\r\nMaster sensor module, F/W:%s", FIRMWARE);
-  serialPutLine(line);
+  char line[60];
+  sprintf(line, "\r\nnRF24 wireless gateway, F/W: %d", FIRMWARE);
+  pcPutLine(line);
+#endif
 
 #if USE_SHELL
   /*
@@ -435,9 +526,7 @@ int main(void) {
   shellInit();
 #endif
 
-  /*
-   * Setup NRF24L01 IRQ pad.
-   */
+  // Setup NRF24L01 IRQ pad.
   palSetPadMode(NRF_PORT_CE_IRQ, NRF_PORT_IRQ, PAL_MODE_INPUT);
   /*
    * Activates the EXT driver 1.
@@ -453,40 +542,52 @@ int main(void) {
    */
   NRFInit();
 
-  static uint8_t txaddr[5], rxaddr[5], rxaddrstr[11] = {'\0'}, txaddrstr[11] = {'\0'};
-  NRFGetAddrs(txaddr, rxaddr);
-  addr_hexstr(rxaddr, rxaddrstr);
-  addr_hexstr(txaddr, txaddrstr);
-  sprintf(line,"CHANNEL: %d, TX ADDR:%s, RX ADDR:%s", CHANNEL, txaddrstr, rxaddrstr);
-  serialPutLine(line);
+  // send thread over NRF24L01+
+  //nrfSendThread_p = chThdCreateStatic(waNRFSendThread, sizeof(waNRFSendThread), NORMALPRIO, nrfSendThread, NULL);
+
+  chMBInit(&mb_read_free, (msg_t*) read_free, NRF_READ_BUFFERS);
+  chMBInit(&mb_read_fill, (msg_t*) read_fill, NRF_READ_BUFFERS);
+
+  // message receive thread from NRF24L01+
+  chThdCreateStatic(waNRFReceiveThread, sizeof(waNRFReceiveThread), NORMALPRIO+1, nrfReceiveThread, NULL);
+
+  // message parse thread from NRF24L01+
+  chThdCreateStatic(waNRFParseThread, sizeof(waNRFParseThread), NORMALPRIO, nrfParseThread, NULL);
 
 #if AES
   aes_initialize(&aes_data, AES_KEY_LENGTH_128_BITS, aes_key, NULL);
 #endif
 
-  chBSemInit(&nrfsem, FALSE);
-
-  // send thread over NRF24L01+
-  nrfSendThread_p = chThdCreateStatic(waNRFSendThread, sizeof(waNRFSendThread), NORMALPRIO, nrfSendThread, NULL);
-  // receive thread from NRF24L01+
-  chThdCreateStatic(waNRFReceiveThread, sizeof(waNRFReceiveThread), NORMALPRIO, nrfReceiveThread, NULL);
-
-  // LED pin PAL mode
-  palSetPadMode(GPIOC, GPIOC_LED, PAL_MODE_OUTPUT_PUSHPULL);
-
-  /*
-   * Creates the blinker thread.
-   */
-  chThdCreateStatic(waBlinkerThread, sizeof(waBlinkerThread), NORMALPRIO, blinkerThread, NULL);
-
   // BMP085 driver init
   bmp085_init();
 
-  // start BMP085 delay timer
-  chVTSet(&delayTimer, MS2ST(BMP085_DELAY_MS/15), delayTimer_handler, 0);
+  // BMP085 polling semaphore
+  chBSemInit(&bmp085sem, FALSE);
 
-  // BMP085 mode switch
-  chBSemInit(&mainsem, TRUE);
+  // start BMP085 polling timer
+  chVTSet(&bmp085Timer, S2ST(BMP085_POLL_S), bmp085Timer_handler, 0);
+
+  chThdCreateStatic(waBMP085Thread, sizeof(waBMP085Thread), NORMALPRIO, BMP085Thread, NULL);
+
+  /*
+   * Creates the MODBUS thread.
+   */
+  createModbusThd();
+
+#if DEBUG
+  uint8_t txaddr[5], rxaddr[5], rxaddrstr[11] = {'\0'}, txaddrstr[11] = {'\0'};
+  NRFGetAddrs(txaddr, rxaddr);
+  addr_hexstr(rxaddr, rxaddrstr);
+  addr_hexstr(txaddr, txaddrstr);
+  sprintf(line,"CHANNEL: %d, TX ADDR:%s, RX ADDR:%s", CHANNEL, txaddrstr, rxaddrstr);
+  pcPutLine(line);
+#endif
+
+  // LED pin PAL mode
+  palSetPadMode(LED_GPIO, LED_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+
+  writeInputReg(FIRMWARE_VERSION, FIRMWARE);
+  uint16_t dummy=0;
 
   /*
    * Normal main() thread activity, in this demo it does nothing except
@@ -494,7 +595,7 @@ int main(void) {
    */
   while (TRUE) {
 #if USE_SHELL
-    if (!shelltp && (SDU1.config->usbp->state == USB_ACTIVE))
+    if (!shelltp)
     	shelltp = shellCreate(&shell_cfg, SHELL_WA_SIZE, NORMALPRIO);
     else {
     	if (chThdTerminated(shelltp)) {
@@ -503,26 +604,10 @@ int main(void) {
     	}
     }
 #endif
-    chBSemWait(&mainsem);
 
-    // BMP085
-    int16_t temperature;
-    uint32_t pressure;
-    static uint8_t readcnt = 3;
-    static bool_t read_ok = FALSE;
-    while (readcnt-- > 0){
-    	read_ok = bmp085_read(&temperature, &pressure) == BMP085_NO_ERROR;
-    	if (read_ok) break;
-    }
-    if (read_ok) {
-    	sprintf(line,"SENSOR:0:BMP085:1:TEMPERATURE:%.2f", (float)temperature/10);
-    	serialPutLine(line);
-    	sprintf(line,"SENSOR:0:BMP085:1:PRESSURE:%.2f", (float)pressure*75/10000);
-    	serialPutLine(line);
-    }
-    else {
-    	sprintf(line,"ERROR:0:BMP085");
-    	serialPutLine(line);
-    }
+    writeInputReg(DUMMY_COUNTER, dummy++);
+    palTogglePad(LED_GPIO, LED_PIN);
+
+   	chThdSleepMilliseconds(1000);
   }
 }

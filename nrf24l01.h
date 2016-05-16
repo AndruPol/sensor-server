@@ -25,7 +25,7 @@
     for full details of how and when the exception can be applied.
 */
 
-#define CHANNEL				0
+#define CHANNEL				120
 
 /*
  * The number of bytes the NRF24L01 RX FIFO is going to hold
@@ -182,10 +182,3 @@ void NRFPWRDown(void);
 void NRFPWRUp(void);
 void NRFGetAddrs(uint8_t *txaddr, uint8_t *rxaddr);
 uint8_t NRFChannelScan(uint8_t chan);
-
-/*
- * NRF thread
- */
-#define NRF_WA_SIZE		256
-extern WORKING_AREA(NRFThreadWA, NRF_WA_SIZE);
-extern msg_t NRFThread(void *arg);

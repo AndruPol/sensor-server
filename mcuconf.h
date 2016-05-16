@@ -35,9 +35,9 @@
  */
 #define STM32_NO_INIT                       FALSE
 #define STM32_HSI_ENABLED                   FALSE
-#define STM32_LSI_ENABLED                   FALSE
+#define STM32_LSI_ENABLED                   TRUE
 #define STM32_HSE_ENABLED                   TRUE
-#define STM32_LSE_ENABLED                   TRUE
+#define STM32_LSE_ENABLED                   FALSE
 #define STM32_SW                            STM32_SW_PLL
 #define STM32_PLLSRC                        STM32_PLLSRC_HSE
 #define STM32_PLLXTPRE                      STM32_PLLXTPRE_DIV1
@@ -49,7 +49,7 @@
 #define STM32_USB_CLOCK_REQUIRED            TRUE
 #define STM32_USBPRE                        STM32_USBPRE_DIV1P5
 #define STM32_MCOSEL                        STM32_MCOSEL_NOCLOCK
-#define STM32_RTCSEL                        STM32_RTCSEL_LSE
+#define STM32_RTCSEL                        STM32_RTCSEL_LSI
 #define STM32_PVD_ENABLE                    FALSE
 #define STM32_PLS                           STM32_PLS_LEV0
 
@@ -85,7 +85,7 @@
  * GPT driver system settings.
  */
 #define STM32_GPT_USE_TIM1                  FALSE
-#define STM32_GPT_USE_TIM2                  FALSE
+#define STM32_GPT_USE_TIM2                  TRUE
 #define STM32_GPT_USE_TIM3                  FALSE
 #define STM32_GPT_USE_TIM4                  FALSE
 #define STM32_GPT_USE_TIM5                  FALSE
@@ -151,7 +151,7 @@
  * SERIAL driver system settings.
  */
 #define STM32_SERIAL_USE_USART1             FALSE
-#define STM32_SERIAL_USE_USART2             FALSE
+#define STM32_SERIAL_USE_USART2             TRUE
 #define STM32_SERIAL_USE_USART3             FALSE
 #define STM32_SERIAL_USE_UART4              FALSE
 #define STM32_SERIAL_USE_UART5              FALSE
@@ -178,7 +178,7 @@
 /*
  * UART driver system settings.
  */
-#define STM32_UART_USE_USART1               FALSE
+#define STM32_UART_USE_USART1               TRUE
 #define STM32_UART_USE_USART2               FALSE
 #define STM32_UART_USE_USART3               FALSE
 #define STM32_UART_USART1_IRQ_PRIORITY      12
@@ -192,7 +192,7 @@
 /*
  * USB driver system settings.
  */
-#define STM32_USB_USE_USB1                  TRUE
+#define STM32_USB_USE_USB1                  FALSE
 #define STM32_USB_LOW_POWER_ON_SUSPEND      FALSE
 #define STM32_USB_USB1_HP_IRQ_PRIORITY      13
 #define STM32_USB_USB1_LP_IRQ_PRIORITY      14

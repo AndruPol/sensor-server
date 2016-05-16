@@ -11,12 +11,22 @@
 extern "C" {
 #endif
 
-#define FIRMWARE			"0.3"	// версия прошивки
-#define BMP085_DELAY_MS		900000	// интервал таймера задержки перед опросом датчика BMP085, мсек
+#define NRF_SENSOR_NUM		4		// wireless sensor modules count
+#define NRF_SENSOR_REGS		4		// max sensors in wireless module
 
-#define MAXSENSORS			16		// max sensors for trace
-#define MSGSIZE				16		// message data size
-#define MSGDUPTIME			30		// duplicate message timeout, s
+#define MAXSENSORS			(NRF_SENSOR_NUM * NRF_SENSOR_REGS)	// max sensors for trace duplicate messages
+#define MSGSIZE				sizeof(MESSAGE_T)					// message data size
+#define MSGDUPTIME			3									// duplicate message timeout, s
+
+#define INT_SENSOR_NUM		1
+#define INT_SENSOR_REGS		4
+typedef enum
+{
+	FIRMWARE_VERSION = 0,
+	DUMMY_COUNTER,
+	BMP085_TEMPERATURE,
+	BMP085_PRESSURE
+} BMP085_MAP;
 
 typedef enum {
 	SENSOR_INFO = 0,	// not implemented
@@ -25,7 +35,7 @@ typedef enum {
 } msgtype_t;
 
 typedef enum {
-	DS1820 = 0,	// not implemented
+	DS1820 = 0,
 	BH1750,
 	DHT,
 	BMP085,
@@ -33,12 +43,20 @@ typedef enum {
 } sensortype_t;
 
 typedef enum {
-	TEMPERATURE = 0,	// not implemented
+	TEMPERATURE = 0,
 	HUMIDITY,
 	PRESSURE,
 	LIGHT,
 	VOLTAGE
 } valuetype_t;
+
+typedef enum
+{
+    BH1750_LIGHT = 0,
+	DS18B20_TEMPERATURE,
+    DHT_TEMPERATURE,
+	DHT_HUMIDITY,
+} NRF_SENSOR_MAP;
 
 // message format
 typedef struct MESSAGE MESSAGE_T;
@@ -69,9 +87,6 @@ struct MESSAGE_TRACE{
 	uint8_t count;						// message time counter
 	MESSAGE_TIME_T	msgtm[MAXSENSORS];	// message time
 };
-
-// convert nrf24l01 5 bytes address to char[11]
-void addr_hexstr(uint8_t *addr, uint8_t *str);
 
 #ifdef __cplusplus
 }

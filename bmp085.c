@@ -8,6 +8,7 @@
 #include "bmp085.h"
 #include "bmp085_table.h"
 
+#define BARO_PRIO			(NORMALPRIO + 1)
 #define I2CD_BMP085			I2CD1
 
 #define BMP085_ADDR 		0x77 // device address
@@ -46,17 +47,18 @@ typedef struct bmp085_t {
 static BMP085_T bmp085;
 static BinarySemaphore bmp085sem;
 static bool_t bmp085_calibrated = FALSE;
+static bmp085_error_t bmp085_error;
 
 // compensated temperature and pressure values
 //uint32_t pval = 0;	// temp in 0.1C
 //int32_t  tval = 0;  // press in Pa
 int32_t  baro_altitude = 0;
 
-static const I2CConfig i2cfg = { OPMODE_I2C, 100000, STD_DUTY_CYCLE, };
+#define N_AWG      		32 			// Averaging values count
+#define FIX_FORMAT 		5  			// 32 == 2^5 to replace division by shift
+static uint32_t 		pres_awg = 10UL << FIX_FORMAT; // aweraged value
 
-#define N_AWG      32 // Averaging values count
-#define FIX_FORMAT 5  // 32 == 2^5 to replace division by shift
-static uint32_t pres_awg = 10UL << FIX_FORMAT; // aweraged value
+static const I2CConfig i2cfg = { OPMODE_I2C, 100000, STD_DUTY_CYCLE, };
 
 /* calculation height from pressure using precalculated table and linear interpolation */
 static int16_t pres_to_height(uint32_t pres){
@@ -115,7 +117,7 @@ static void bmp085_calculate(int16_t *tval, uint32_t *pval){
 // read calibrate data
 static int16_t read_calibrate(uint8_t addr, bmp085_error_t *error) {
   static uint8_t txbuf[2] = {0}, rxbuf[2] = {0};
-  *error = BMP085_NO_ERROR;
+  *error = BMP085_OK;
   txbuf[0] = addr;
   if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 1, rxbuf, 2, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
 	*error = BMP085_TIMEOUT;
@@ -142,9 +144,9 @@ static msg_t BaroThread(void *arg){
 	req = (bmp085_read_t *) chMsgGet(tp);
 	chMsgRelease(tp, (msg_t) req);
 
-	req->error = BMP085_NO_ERROR;
+	bmp085_error = BMP085_OK;
 	if (!bmp085_calibrated){
-		req->error = BMP085_ERROR;
+		bmp085_error = BMP085_CALIBRATE;
 		goto error;
 	}
 
@@ -152,7 +154,7 @@ static msg_t BaroThread(void *arg){
     txbuf[1] = BMP085_TEMP;
     i2cAcquireBus(&I2CD_BMP085);
     if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 2, NULL, 0, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
-		req->error = BMP085_TIMEOUT;
+    	bmp085_error = BMP085_TIMEOUT;
 		goto error;
 
     }
@@ -165,7 +167,7 @@ static msg_t BaroThread(void *arg){
     txbuf[0] = BMP085_ADC_MSB;
     i2cAcquireBus(&I2CD_BMP085);
     if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 1, rxbuf, 2, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
-		req->error = BMP085_TIMEOUT;
+    	bmp085_error = BMP085_TIMEOUT;
 		goto error;
     }
     i2cReleaseBus(&I2CD_BMP085);
@@ -177,7 +179,7 @@ static msg_t BaroThread(void *arg){
     txbuf[1] = (BMP085_PRES + (BMP085_OSS<<6));
     i2cAcquireBus(&I2CD_BMP085);
     if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 2, NULL, 0, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
-		req->error = BMP085_TIMEOUT;
+    	bmp085_error = BMP085_TIMEOUT;
 		goto error;
     }
     i2cReleaseBus(&I2CD_BMP085);
@@ -190,7 +192,7 @@ static msg_t BaroThread(void *arg){
     txbuf[0] = BMP085_ADC_XLSB;
     i2cAcquireBus(&I2CD_BMP085);
     if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 1, rxbuf, 2, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
-		req->error = BMP085_TIMEOUT;
+    	bmp085_error = BMP085_TIMEOUT;
 		goto error;
     }
     i2cReleaseBus(&I2CD_BMP085);
@@ -201,7 +203,7 @@ static msg_t BaroThread(void *arg){
     txbuf[0] = BMP085_ADC_MSB;
     i2cAcquireBus(&I2CD_BMP085);
     if (i2cMasterTransmitTimeout(&I2CD_BMP085, BMP085_ADDR, txbuf, 1, rxbuf, 2, MS2ST(BMP085_TIMEOUT_MS)) == RDY_TIMEOUT){
-		req->error = BMP085_TIMEOUT;
+    	bmp085_error = BMP085_TIMEOUT;
 		goto error;
     }
     /* now we have all 3 bytes. Calculate pressure using black magic from datasheet */
@@ -223,24 +225,33 @@ void bmp085_init(void) {
   palSetPadMode(GPIOB, GPIOB_PIN6, PAL_MODE_STM32_ALTERNATE_OPENDRAIN);
   palSetPadMode(GPIOB, GPIOB_PIN7, PAL_MODE_STM32_ALTERNATE_OPENDRAIN);
 
-  bmp085_error_t error;
-  error = BMP085_NO_ERROR;
+  bmp085_error = BMP085_OK;
 
   i2cAcquireBus(&I2CD_BMP085);
-  bmp085.cc.ac1 = read_calibrate(0xAA, &error);
-  bmp085.cc.ac2 = read_calibrate(0xAC, &error);
-  bmp085.cc.ac3 = read_calibrate(0xAE, &error);
-  bmp085.cc.ac4 = read_calibrate(0xB0, &error);
-  bmp085.cc.ac5 = read_calibrate(0xB2, &error);
-  bmp085.cc.ac6 = read_calibrate(0xB4, &error);
-  bmp085.cc.b1  = read_calibrate(0xB6, &error);
-  bmp085.cc.b2  = read_calibrate(0xB8, &error);
-  bmp085.cc.mb  = read_calibrate(0xBA, &error);
-  bmp085.cc.mc  = read_calibrate(0xBC, &error);
-  bmp085.cc.md  = read_calibrate(0xBE, &error);
+  bmp085.cc.ac1 = read_calibrate(0xAA, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.ac2 = read_calibrate(0xAC, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.ac3 = read_calibrate(0xAE, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.ac4 = read_calibrate(0xB0, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.ac5 = read_calibrate(0xB2, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.ac6 = read_calibrate(0xB4, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.b1  = read_calibrate(0xB6, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.b2  = read_calibrate(0xB8, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.mb  = read_calibrate(0xBA, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.mc  = read_calibrate(0xBC, &bmp085_error);
+  if (bmp085_error == BMP085_OK)
+	  bmp085.cc.md  = read_calibrate(0xBE, &bmp085_error);
   i2cReleaseBus(&I2CD_BMP085);
 
-  bmp085_calibrated = (error == BMP085_NO_ERROR);
+  bmp085_calibrated = (bmp085_error == BMP085_OK);
   baroThread_p = chThdCreateStatic(waBaroThread, sizeof(waBaroThread), BARO_PRIO, BaroThread, NULL);
 }
 
@@ -259,12 +270,12 @@ bmp085_error_t bmp085_read(int16_t *temperature, uint32_t *pressure) {
 	}
 	chBSemReset(&bmp085sem, FALSE);
 
-	if(rd.error != BMP085_NO_ERROR) {
-		return rd.error;
+	if(bmp085_error != BMP085_OK) {
+		return bmp085_error;
 	}
 
     // calculate temp & press
     bmp085_calculate(temperature, pressure);
 
-	return BMP085_NO_ERROR;
+	return BMP085_OK;
 }

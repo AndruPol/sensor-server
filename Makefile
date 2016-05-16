@@ -8,7 +8,7 @@ ifeq ($(USE_OPT),)
   USE_OPT = -O2 -std=gnu99 -ggdb -fomit-frame-pointer -falign-functions=16
 endif
 
-# C specific options here (added to USE_OPT).
+# C specific opt0ions here (added to USE_OPT).
 ifeq ($(USE_COPT),)
   USE_COPT = 
 endif
@@ -58,16 +58,19 @@ endif
 PROJECT = rserver
 
 # Imported source files and paths
-CHIBIOS = ../chibios/ChibiOS_2.6.4
-include UET_STM32_F103/board.mk
+CHIBIOS = ../chibios/chibios-2.6.x
+#include UET_STM32_F103/board.mk
+include STM32F103C_MINI/board.mk
 include $(CHIBIOS)/os/hal/platforms/STM32F1xx/platform.mk
 include $(CHIBIOS)/os/hal/hal.mk
 include $(CHIBIOS)/os/ports/GCC/ARMCMx/STM32F1xx/port.mk
 include $(CHIBIOS)/os/kernel/kernel.mk
 include aes/aes.mk
+include FreeModbus/modbus.mk
 
 # Define linker script file here
-LDSCRIPT= STM32F103xE.ld
+#LDSCRIPT= STM32F103xE.ld
+LDSCRIPT= STM32F103x8.ld
 
 # C sources that can be compiled in ARM or THUMB mode depending on the global
 # setting.
@@ -81,11 +84,14 @@ CSRC = $(PORTSRC) \
        $(CHIBIOS)/os/various/shell.c \
        $(CHIBIOS)/os/various/chprintf.c \
        $(AESSRC) \
+       $(MODBUSSRC) \
        util/printfs.c util/itoa.c util/utoa.c util/floatp10.c \
        bmp085.c \
        nrf_spi.c nrf24l01.c \
-       usb_serial.c \
+       modbas_slave.c \
        main.c
+
+#       usb_serial.c \
 
 # C++ sources that can be compiled in ARM or THUMB mode depending on the global
 # setting.
@@ -116,7 +122,9 @@ ASMSRC = $(PORTASM)
 
 INCDIR = $(PORTINC) $(KERNINC) \
          $(HALINC) $(PLATFORMINC) $(BOARDINC) \
-         $(CHIBIOS)/os/various $(AESINC)
+         $(CHIBIOS)/os/various \
+         $(AESINC) \
+         $(MODBUSINC)
 
 #
 # Project, sources and paths
