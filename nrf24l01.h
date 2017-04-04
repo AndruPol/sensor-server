@@ -25,7 +25,11 @@
     for full details of how and when the exception can be applied.
 */
 
-#define CHANNEL				120
+#ifndef NRF24L01_H_
+#define NRF24L01_H_
+
+#define NRF_CHANNEL			120
+#define NRF_ADDR_LEN		5
 
 /*
  * The number of bytes the NRF24L01 RX FIFO is going to hold
@@ -103,12 +107,15 @@ struct _NRFD {
   /*
    * Binary semaphore, to lock access to the send and receive queue of the NRF24L01
    */
-  BinarySemaphore 	NRFSemIRQ;
-  BinarySemaphore	NRFSemRX;
-  BinarySemaphore	NRFSemTX;
+  binary_semaphore_t 	NRFSemIRQ;
+  binary_semaphore_t	NRFSemRX;
+  binary_semaphore_t	NRFSemTX;
 };
 
 extern NRFD nrf;
+
+extern uint8_t nrfSndAddr[];
+extern uint8_t nrfRcvAddr[];
 
 /*
  * Initialize the NRF24L01 Wifi chip.
@@ -136,7 +143,7 @@ void NRFtest(void);
  * This functions blocks until data is available
  * The send output buffer needs to be NRF_FIFO_BYTES(32) bytes wide
  */
-bool_t NRFSendData(uint8_t *inBuf);
+bool NRFSendData(uint8_t *inBuf);
 
 /*
  * Routine to unlock IRQ handling.
@@ -178,7 +185,10 @@ void NRFSetRecvAddr(uint8_t pipe, uint8_t addr[], uint8_t addrSize);
  */
 void NRFSetSendAddr(uint8_t addr[], uint8_t addrSize);
 
+void NRFChangeSendAddr(uint8_t addr[], uint8_t addrSize);
+
 void NRFPWRDown(void);
 void NRFPWRUp(void);
-void NRFGetAddrs(uint8_t *txaddr, uint8_t *rxaddr);
 uint8_t NRFChannelScan(uint8_t chan);
+
+#endif

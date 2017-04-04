@@ -9,7 +9,6 @@ MODBUSPORTSRC = ${MODBUSPORT}/portother.c \
 #		${MODBUSPORT}/porttcp.c
 
 MODBUSSRC =	${MODBUS}/mb.c \
-		${MODBUS}/mb_m.c \
 		${MODBUS}/functions/mbfuncinput.c \
 		${MODBUS}/functions/mbfuncdisc.c \
 		${MODBUS}/functions/mbfuncholding.c \
@@ -17,12 +16,7 @@ MODBUSSRC =	${MODBUS}/mb.c \
 		${MODBUS}/functions/mbfunccoils.c \
 		${MODBUS}/functions/mbfuncdiag.c \
 		${MODBUS}/functions/mbfuncother.c \
-		${MODBUS}/functions/mbfuncinput_m.c \
-		${MODBUS}/functions/mbfuncdisc_m.c \
-		${MODBUS}/functions/mbfuncholding_m.c \
-		${MODBUS}/functions/mbfunccoils_m.c \
 		${MODBUS}/rtu/mbrtu.c \
-		${MODBUS}/rtu/mbrtu_m.c \
 		${MODBUS}/rtu/mbcrc.c \
 		${MODBUS}/ascii/mbascii.c \
 		${MODBUS}/tcp/mbtcp.c \

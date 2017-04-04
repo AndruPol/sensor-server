@@ -34,11 +34,14 @@
 #include "nrf_spi.h"
 #include "nrf24l01.h"
 
-#define NRF_WA_SIZE					256
-#define NRF_PRIO					(NORMALPRIO+2)
+#define NRF_WA_SIZE					192
+#define NRF_PRIO					(NORMALPRIO+3)
 
 #define NRF_TRANSMIT_TIMEOUT_MS		3
-static uint8_t sendAddr[5] = {0xAE, 0xAE, 0xAE, 0xAE, 0x01};
+
+// TODO: changed for test only
+uint8_t nrfSndAddr[5] = {0x2E, 0x3E, 0x4E, 0x5E, 0x00};
+uint8_t nrfRcvAddr[5] = {0x01, 0xAE, 0xAE, 0xAE, 0xAE};
 
 NRFD nrf;
 
@@ -120,6 +123,7 @@ typedef enum {low=0, high} boolEnum;
 #define NRF_FIFO_RX_FULL			0b00000010	/* RX FIFO full flag					*/
 #define NRF_FIFO_RX_EMPTY			0b00000001	/* RX FIFO empty flag					*/
 
+#if 0
 /*
  * Reverse buffer (Used to reverse addresses)
  */
@@ -131,6 +135,7 @@ static void NRFReverseBuf(uint8_t in[], uint8_t out[], size_t size)
 		out[count]=in[size-(count+1)];
 	}
 }
+#endif
 
 /*
  * Set CE to high/low
@@ -181,91 +186,33 @@ void NRFSetChannel(uint8_t chan)
 }
 
 /*
- * Set the address to the receiver pipe
- * Normaly pipe  is used to receive the ack packets by shockburst
- * Use pipe 1 as the first data receive pipe
- * @Arguments
- * pipe				Pipe number to set the address to
- * addr_size	The size of the address in bytes
- * addr				Byte array holding the addr, LSB first
+ * Flush the TX Queue
  */
-void NRFSetRecvAddr(uint8_t pipe, uint8_t addr[], uint8_t addrSize)
+void NRFFlushTX(void)
 {
-	uint8_t nrfCommand;
-	uint8_t pipeAddr[5]={'\0'};
+	uint8_t command;
+	uint8_t result;
 
-	/*
-	 * CE to low When configuring
-	 */
-	NRFSetCE(low);
-
-	/*
-	 * Create command
-	 */
-	nrfCommand=NRF_REG_RX_ADDR_P0 + pipe;
-
-	/*
-	 * As lsb needs to be sent first, reverse the address order.
-	 */
-	NRFReverseBuf(addr, pipeAddr, addrSize);
-
-	/*
-	 * Set address
-	 */
-	NRFWriteReg(nrfCommand, pipeAddr, addrSize);
-}
-
-/*
- * Set the address to the receiver pipe
- * @Arguments
- * pipe				Pipe number to set the address to
- * addr_size	The size of the address in bytes
- * addr				Byte array holding the address, LSB first
- */
-void NRFSetSendAddr(uint8_t addr[], uint8_t addrSize)
-{
-	uint8_t nrfCommand;
-	uint8_t pipeAddr[5]={'\0'};
-
-	/*
-	 * CE to low When configuring
-	 */
-	NRFSetCE(low);
-
-	/*
-	 * As lsb needs to be sent first, reverse the address order.
-	 */
-	NRFReverseBuf(addr, pipeAddr, addrSize);
-
-	/*
-	 * Set pipe 0 address identical to send address,
-	 * this to enable the automatic shockburst handling of ack's
-	 */
-	nrfCommand=NRF_REG_RX_ADDR_P0;
-	NRFWriteReg(nrfCommand, pipeAddr, addrSize);
-
-	/*
-	 * Set the TX pipe address
-	 */
-	nrfCommand=NRF_REG_TX_ADDR;
-	NRFWriteReg(nrfCommand, pipeAddr, addrSize);
-}
-
-/*
- * Get Status from inside interrupt routine
- */
-static uint8_t NRFGetStatus(void)
-{
-	uint8_t command[2];
-	uint8_t result[2];
-	
 	/*
 	 * Set NOP and receive the STATUS register
 	 */
-	command[0]=NRF_COM_NOP;
-	SPIExchangeData(&SPID1, command, result, 2);
+	command=NRF_COM_FLUSH_TX;
+	SPIExchangeData(&SPID1, &command, &result, 1);
+}
 
-	return result[0];
+/*
+ * Flush RX
+ */
+static void NRFFlushRX(void)
+{
+	uint8_t command[1];
+	uint8_t result[1];
+
+	/*
+	 * Set NOP and receive the STATUS register
+	 */
+	command[0]=NRF_COM_FLUSH_RX;
+	SPIExchangeData(&SPID1, command, result, 1);
 }
 
 /*
@@ -275,28 +222,11 @@ static uint8_t NRFGetConfig(void)
 {
 	uint8_t command[2];
 	uint8_t result[2];
-	
+
 	/*
 	 * Set NOP and receive the STATUS register
 	 */
 	command[0]=NRF_COM_READREG | NRF_REG_CONFIG;
-	SPIExchangeData(&SPID1, command, result, 2);
-
-	return result[1];
-}
-
-/*
- * Get register value
- */
-static uint8_t NRFReadReg(uint8_t reg)
-{
-	uint8_t command[2];
-	uint8_t result[2];
-
-	/*
-	 * Set NOP and receive the STATUS register
-	 */
-	command[0]=NRF_COM_READREG | reg;
 	SPIExchangeData(&SPID1, command, result, 2);
 
 	return result[1];
@@ -314,44 +244,13 @@ static void NRFSetConfig(uint8_t config)
 }
 
 /*
- * Reset status flags inside interrupt routine
- */
-static void NRFResetStatus(uint8_t statMask)
-{
-	uint8_t command[2];
-	uint8_t result[2];
-	
-	/*
-	 * Set NOP and receive the STATUS register
-	 */
-	command[0]=NRF_COM_WRITEREG | NRF_REG_STATUS;
-	command[1]=statMask;
-	SPIExchangeData(&SPID1, command, result, 2);
-}
-
-/*
- * Flush the TX Queue
- */
-void NRFFlushTX(void)
-{
-	uint8_t command;
-	uint8_t result;
-	
-	/*
-	 * Set NOP and receive the STATUS register
-	 */
-	command=NRF_COM_FLUSH_TX;
-	SPIExchangeData(&SPID1, &command, &result, 1);
-}
-
-/*
  * Set Reset PRIM_RX in CONFIG register.
  * State 1 for on, 0 for off.
  */
 static void NRFSetPrimRx(primEnum state)
 {
 	uint8_t config=0;
-	
+
 	/*
 	 * Put CE low
 	 */
@@ -376,6 +275,180 @@ static void NRFSetPrimRx(primEnum state)
 	 * Set config register
 	 */
 	NRFSetConfig(config);
+}
+
+/*
+ * Set the address to the receiver pipe
+ * Normaly pipe  is used to receive the ack packets by shockburst
+ * Use pipe 1 as the first data receive pipe
+ * @Arguments
+ * pipe				Pipe number to set the address to
+ * addr_size	The size of the address in bytes
+ * addr				Byte array holding the addr, LSB first
+ */
+void NRFSetRecvAddr(uint8_t pipe, uint8_t addr[], uint8_t addrSize)
+{
+	uint8_t nrfCommand;
+//	uint8_t pipeAddr[addrSize];
+
+	/*
+	 * CE to low When configuring
+	 */
+	NRFSetCE(low);
+
+	/*
+	 * Create command
+	 */
+	nrfCommand=NRF_REG_RX_ADDR_P0 + pipe;
+
+	/*
+	 * As lsb needs to be sent first, reverse the address order.
+	 */
+//	NRFReverseBuf(addr, pipeAddr, addrSize);
+
+	/*
+	 * Set address
+	 */
+	NRFWriteReg(nrfCommand, addr, addrSize);
+}
+
+/*
+ * Set the address to the receiver pipe
+ * @Arguments
+ * pipe				Pipe number to set the address to
+ * addr_size	The size of the address in bytes
+ * addr				Byte array holding the address, LSB first
+ */
+void NRFSetSendAddr(uint8_t addr[], uint8_t addrSize)
+{
+	uint8_t nrfCommand;
+//	uint8_t pipeAddr[addrSize];
+
+	/*
+	 * As lsb needs to be sent first, reverse the address order.
+	 */
+//	NRFReverseBuf(addr, pipeAddr, addrSize);
+
+	/*
+	 * Set pipe 0 address identical to send address,
+	 * this to enable the automatic shockburst handling of ack's
+	 */
+	nrfCommand=NRF_REG_RX_ADDR_P0;
+	NRFWriteReg(nrfCommand, addr, addrSize);
+
+	/*
+	 * Set the TX pipe address
+	 */
+	nrfCommand=NRF_REG_TX_ADDR;
+	NRFWriteReg(nrfCommand, addr, addrSize);
+}
+
+/*
+ * Change the address to the receiver pipe
+ * @Arguments
+ * pipe				Pipe number to set the address to
+ * addr_size	The size of the address in bytes
+ * addr				Byte array holding the address, LSB first
+ */
+void NRFChangeSendAddr(uint8_t addr[], uint8_t addrSize)
+{
+	uint8_t nrfCommand;
+//	uint8_t pipeAddr[addrSize];
+
+	/*
+	 * Set PRIM_RX register.
+	 */
+	NRFSetPrimRx(prim_tx);
+
+	/*
+	 * Put CE low
+	 */
+	NRFSetCE(low);
+
+	NRFWriteSingleReg(NRF_REG_STATUS	, 0b01110000);		/* Reset the IRQ registers.				*/
+
+	NRFFlushTX();
+	NRFFlushRX();
+
+	/*
+	 * As lsb needs to be sent first, reverse the address order.
+	 */
+//	NRFReverseBuf(addr, pipeAddr, addrSize);
+
+	/*
+	 * Set pipe 0 address identical to send address,
+	 * this to enable the automatic shockburst handling of ack's
+	 */
+	nrfCommand=NRF_REG_RX_ADDR_P0;
+	NRFWriteReg(nrfCommand, addr, addrSize);
+
+	/*
+	 * Set the TX pipe address
+	 */
+	nrfCommand=NRF_REG_TX_ADDR;
+	NRFWriteReg(nrfCommand, addr, addrSize);
+
+	/*
+	 * Set PRIM_RX register.
+	 */
+	NRFSetPrimRx(prim_rx);
+
+	/*
+	 * Put CE low
+	 */
+	NRFSetCE(high);
+}
+
+/*
+ * Get Status from inside interrupt routine
+ */
+static uint8_t NRFGetStatus(void)
+{
+	uint8_t command[2];
+	uint8_t result[2];
+	
+	/*
+	 * Set NOP and receive the STATUS register
+	 */
+	command[0]=NRF_COM_NOP;
+	SPIExchangeData(&SPID1, command, result, 2);
+
+	return result[0];
+}
+
+#if 0
+/*
+ * Get register value
+ */
+static uint8_t NRFReadReg(uint8_t reg)
+{
+	uint8_t command[2];
+	uint8_t result[2];
+
+	/*
+	 * Set NOP and receive the STATUS register
+	 */
+	command[0]=NRF_COM_READREG | reg;
+	SPIExchangeData(&SPID1, command, result, 2);
+
+	return result[1];
+}
+#endif
+
+/*
+ * Reset status flags inside interrupt routine
+ */
+static void NRFResetStatus(uint8_t statMask)
+{
+	uint8_t command[2];
+	uint8_t result[2];
+	
+	/*
+	 * Set NOP and receive the STATUS register
+	 */
+	command[0]=NRF_COM_WRITEREG | NRF_REG_STATUS;
+	command[1]=statMask;
+	SPIExchangeData(&SPID1, command, result, 2);
 }
 
 /*
@@ -588,22 +661,23 @@ void NRFReceiveData(uint8_t *pipeNr, uint8_t *inBuf)
  * This functions blocks until data is available
  * The send output buffer needs to be NRF_FIFO_BYTES(32) bytes wide
  */
-bool_t NRFSendData(uint8_t *outBuf)
+bool NRFSendData(uint8_t *outBuf)
 {
+	bool ret = 0;
+
 	/*
 	 * Wait for semaphore NRFSemTX
 	 */
-	if (chBSemWaitTimeout(&nrf.NRFSemTX, MS2ST(NRF_TRANSMIT_TIMEOUT_MS)) == RDY_TIMEOUT){
+	if (chBSemWaitTimeout(&nrf.NRFSemTX, MS2ST(NRF_TRANSMIT_TIMEOUT_MS)) == MSG_TIMEOUT){
 		NRFFlushTX();
 	}
 
 	if (nrf.txstate == NRF_TX_IDLE){
-		nrf.rxstate = NRF_RX_IDLE;
-
 		/*
 		 * Set PRIM_RX register.
 		 */
 		NRFSetPrimRx(prim_tx);
+		nrf.rxstate = NRF_RX_IDLE;
 	}
 
 	nrf.txstate = NRF_TX_ACTIVE;
@@ -624,8 +698,9 @@ bool_t NRFSendData(uint8_t *outBuf)
 	NRFSetCE(low);
 	NRFSetCE(high);
 
-	chThdSleepMicroseconds(NRF_TRANSMIT_TIMEOUT_MS);
-	bool_t ret = (nrf.flags == NRF_TX_NO_ERROR && nrf.txstate == NRF_TX_COMPLETE);
+	if(chBSemWaitTimeout(&nrf.NRFSemTX, MS2ST(NRF_TRANSMIT_TIMEOUT_MS)) == MSG_OK) {
+		ret = (nrf.flags == NRF_TX_NO_ERROR && nrf.txstate == NRF_TX_COMPLETE);
+	}
 
 	/*
 	 * Set PRIM_RX register.
@@ -705,26 +780,10 @@ uint8_t NRFCarrier(void)
 }
 
 /*
- * Flush RX
- */
-static void NRFFlushRX(void)
-{
-	uint8_t command[1];
-	uint8_t result[1];
-
-	/*
-	 * Set NOP and receive the STATUS register
-	 */
-	command[0]=NRF_COM_FLUSH_RX; 
-	SPIExchangeData(&SPID1, command, result, 1);
-}
-
-/*
  * NRF thread
  */
-static WORKING_AREA(nrfIRQThreadWA, NRF_WA_SIZE);
-__attribute__((noreturn))
-static msg_t nrfIRQThread(void *arg) {
+static THD_WORKING_AREA(nrfIRQThreadWA, NRF_WA_SIZE);
+static THD_FUNCTION(nrfIRQThread, arg) {
 	(void)arg;
 	chRegSetThreadName("nrfIRQThd");
 	while (TRUE) {
@@ -737,12 +796,14 @@ static msg_t nrfIRQThread(void *arg) {
  */
 void NRFInit(void)
 {
+	nrf.state = NRF_UNINIT;
+
 	/*
 	 * Initialize the FIFO semaphores 
 	 */
-	chBSemInit(&nrf.NRFSemIRQ, TRUE);	/* Locks the thread until an IRQ arrives							*/
-	chBSemInit(&nrf.NRFSemRX, TRUE);	/* Semaphore initialized as taken, because no data is ready yet		*/
-	chBSemInit(&nrf.NRFSemTX, FALSE);	/* Semaphore initialized as free, because transmit channel is open	*/
+	chBSemObjectInit(&nrf.NRFSemIRQ, TRUE);	/* Locks the thread until an IRQ arrives							*/
+	chBSemObjectInit(&nrf.NRFSemRX, TRUE);	/* Semaphore initialized as taken, because no data is ready yet		*/
+	chBSemObjectInit(&nrf.NRFSemTX, FALSE);	/* Semaphore initialized as free, because transmit channel is open	*/
 
 	SPIInit();
 	/*
@@ -755,30 +816,14 @@ void NRFInit(void)
 	 * Set configuration registers
 	 */
 	NRFWriteSingleReg(NRF_REG_CONFIG	, 0b00001110);		/* ENABLE CRC, POWER_UP					*/
-	NRFWriteSingleReg(NRF_REG_EN_RXADDR	, 0b00000001);		/* Enable data pipe 0,1					*/
-	NRFWriteSingleReg(NRF_REG_EN_AA		, 0b00000001);		/* Enhanced ShockBurst on channel 0,1	*/
+	NRFWriteSingleReg(NRF_REG_EN_RXADDR	, 0b00000011);		/* Enable data pipe 0,1					*/
+	NRFWriteSingleReg(NRF_REG_EN_AA		, 0b00000011);		/* Enhanced ShockBurst on channel 0,1	*/
 	NRFWriteSingleReg(NRF_REG_SETUP_AW	, 0b00000011);		/* 5 bytes address width				*/
 	NRFWriteSingleReg(NRF_REG_SETUP_RETR, 0b00110011);		/* Up to 3 Re-Transmit, Wait 1000uS		*/
 	NRFWriteSingleReg(NRF_REG_RF_SETUP	, 0b00000111);		/* Sets up the channel we work on		*/
 	NRFWriteSingleReg(NRF_REG_STATUS	, 0b01110000);		/* Reset the IRQ registers.				*/
 	NRFWriteSingleReg(NRF_REG_RX_PW_P0	, NRF_FIFO_BYTES);	/* Pipe 0 FIFO holds 32 bytes.			*/
-	//NRFWriteSingleReg(NRF_REG_RX_PW_P1	, NRF_FIFO_BYTES);	/* Pipe 1 FIFO holds 32 bytes.			*/
-	/* dynamic payload on data pipe 0,1 activate */
-	/*
-	 * http://forum.diyembedded.com/viewtopic.php?f=4&t=1187
-	 */
-//	NRFWriteSingleReg(NRF_REG_DYNPD		, 0b00000001);		/* ENABLE dynamic payload length data pipe 0,1	*/
-//	NRFWriteSingleReg(NRF_REG_FEATURE	, 0b00000110);		/* ENABLE EN_DPL, EN_ACK_PAY			*/
-//	if (NRFReadReg(NRF_REG_FEATURE) == 0){
-//		uint8_t command[2];
-//		uint8_t result[2];
-
-//		command[0] = NRF_COM_ACTIVATE;
-//		command[1] = 0x73;
-//		SPIExchangeData(&SPID1, command, result, 2);
-
-//		NRFWriteSingleReg(NRF_REG_FEATURE	, 0b00000110);		/* ENABLE EN_DPL, EN_ACK_PAY			*/
-//	}
+	NRFWriteSingleReg(NRF_REG_RX_PW_P1	, NRF_FIFO_BYTES);	/* Pipe 0 FIFO holds 32 bytes.			*/
 
 	/*
 	 * Flush TX and RX
@@ -787,14 +832,19 @@ void NRFInit(void)
 	NRFFlushRX();
 
 	/*
-	 * Set device to channel 120
+	 * Set device to channel
 	 */
-	NRFSetChannel(CHANNEL);
+	NRFSetChannel(NRF_CHANNEL);
 
 	/*
-	 * Setup address for send and receive pipe
+	 * Setup address for receive pipe 1
 	 */
-	NRFSetSendAddr(sendAddr, 5);
+	NRFSetRecvAddr(1, nrfRcvAddr, NRF_ADDR_LEN);
+
+	/*
+	 * Setup address for send and receive pipe 0
+	 */
+	NRFSetSendAddr(nrfSndAddr, NRF_ADDR_LEN);
 
 	/*
 	 * Set PRIM_RX register.
@@ -879,7 +929,8 @@ void NRFGetAddrs(uint8_t *txaddr, uint8_t *rxaddr)
 	memset(rxbuf, 0, sizeof(rxbuf));
 	txbuf[0] = (NRF_COM_READREG | NRF_REG_TX_ADDR);
 	SPIExchangeData(&SPID1, txbuf, rxbuf, 6);
-	NRFReverseBuf(rxbuf+1, txaddr, 5);
+//	NRFReverseBuf(rxbuf+1, txaddr, 5);
+	memcpy(txaddr, rxbuf+1, 5);
 
 	/*
 	 * DEBUG, try to read the P0 address
@@ -887,7 +938,8 @@ void NRFGetAddrs(uint8_t *txaddr, uint8_t *rxaddr)
 	memset(rxbuf, 0, sizeof(rxbuf));
 	txbuf[0]=(NRF_COM_READREG | NRF_REG_RX_ADDR_P0);
 	SPIExchangeData(&SPID1, txbuf, rxbuf, 6);
-	NRFReverseBuf(rxbuf+1, rxaddr, 5);
+//	NRFReverseBuf(rxbuf+1, rxaddr, 5);
+	memcpy(rxaddr, rxbuf+1, 5);
 }
 
 uint8_t NRFChannelScan(uint8_t chan){

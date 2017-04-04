@@ -21,112 +21,122 @@
 #include "main.h"
 #include "nrf24l01.h"
 #include "bmp085.h"
+#include "eeprom.h"
 #include "util/printfs.h"
+#include "util/crc8.h"
+#include "iwdg_driver.h"
 
 #include <string.h>
 
-#define FIRMWARE			101		// версия прошивки
-#define BMP085_POLL_S		900		// интервал таймера опроса датчика BMP085, сек
-#define BMP085_TRYCNT		3		// max попыток чтения датчика BMP085
+#define FIRMWARE			201		// версия прошивки
+#define MAGIC				0xAE68	// eeprom magic data
+#define BMP085_POLL_S		90		// интервал таймера опроса датчика BMP085, сек
+#define NRFSEND_MAX			5
+
+//#define OLDDEVMAX			0		// old devices id max
+#define CMDTIMERINT			10		// command delay timer interval, mS
+#define CMDDELAY			5		// delay before send command after receive message = CMDDELAY * CMDTIMERINT (mS)
 
 /* ----------------------- Modbus includes ----------------------------------*/
 #include "modbus_slave.h"
 
-#define LED_GPIO			GPIOC
-#define LED_PIN				13
+#define LED_GPIO			GPIOB
+#define LED_PIN				2
 
-#define USE_SHELL			0		// ChibiOS shell use
-#if USE_SHELL
-#include "evtimer.h"
-#include "chrtclib.h"
-#include "shell.h"
-#endif
-
-#define AES					1		// decrypt received data
+#define USE_AES				1		// AES encryption flag
+#define USE_BMP085			1		// BMP085 polling
 #define DEBUG				0
 
-#if AES
-#include "aes/inc/aes.h"
-#include "aes/inc/aes_user_options.h"
+#if USE_AES
+#include "aes.h"
 #include "aes_secret.h"
-static aes_data_t aes_data;
 #endif
 
-static VirtualTimer bmp085Timer;
-static BinarySemaphore bmp085sem;
+CONFIG_T config;
+MESSAGE_T rcvmsg;
+MESSAGE_T *prcvMsg = &rcvmsg;
 
-static BinarySemaphore mcusem;
-static MESSAGE_TRACE_T msgtrace = {0};
+static virtual_timer_t bmp085Timer, cmdTimer;
+static binary_semaphore_t bmp085sem;
+event_source_t event_src, cmd_src;
 
 #define NRF_READ_BUFFERS	6
 static MESSAGE_T nrf_read_buf[NRF_READ_BUFFERS];
 static MESSAGE_T *read_free[NRF_READ_BUFFERS];
 static MESSAGE_T *read_fill[NRF_READ_BUFFERS];
-static MAILBOX_DECL(mb_read_free, (msg_t*) read_free, NRF_READ_BUFFERS);
-static MAILBOX_DECL(mb_read_fill, (msg_t*) read_fill, NRF_READ_BUFFERS);
+static mailbox_t mb_read_free, mb_read_fill;
 
-// convert nrf24l01 5 bytes address to char[11]
-static void addr_hexstr(uint8_t *addr, uint8_t *str){
-    uint8_t *pin = addr;
-    const char *hex = "0123456789ABCDEF";
-    uint8_t *pout = str;
-    for(uint8_t i=0; i < 5; i++){
-        *pout++ = hex[(*pin>>4)&0xF];
-        *pout++ = hex[(*pin++)&0xF];
-    }
-    *pout = 0;
+#define NRF_SEND_BUFFERS	6
+static MESSAGE_T nrf_send_buf[NRF_SEND_BUFFERS];
+static MESSAGE_T *send_free[NRF_SEND_BUFFERS];
+static MESSAGE_T *send_fill[NRF_SEND_BUFFERS];
+static mailbox_t mb_send_free, mb_send_fill;
+
+static DEVCMD_T * pdevcmd;
+static volatile uint8_t devcmdcnt;
+
+static void executeCmd4Gate(uint16_t command, uint16_t param);
+
+#define GATE_CMD_NONE		0
+#define GATE_CMD_RESTART	1
+#define GATE_CMD_CFGWRITE	2
+static volatile uint8_t cmd_flag;
+
+/*===========================================================================*/
+/* IWDG related.
+         */
+/*===========================================================================*/
+static const IWDGConfig iwdgcfg = {
+        2400,                 // 2400 * 1.6mS = ~3.84S IWDG reset time
+        IWDG_DIV_64           // 64 / ~40000 = 1.6mS
+};
+
+static uint8_t devcmd_search(uint8_t deviceID, uint8_t *devidx) {
+	for (uint8_t i = 0; i < devcmdcnt; i++) {
+	  if (pdevcmd[i].deviceID == deviceID) {
+		  *devidx = i;
+		  return 1;
+	  }
+	}
+	return 0;
 }
 
-void pcPutLine(const char *line) {
-	chBSemWait(&mcusem);
-	chprintf((BaseSequentialStream *)&SD2,"%s\r\n", line);
-	chBSemSignal(&mcusem);
+// set modbus error status for gateway
+static void gate_error(gate_error_t error, uint8_t param) {
+	int16_t nreg = mbmap_nreg(0, GATE_STATUS, DEV_INT);
+	if (nreg >= 0) {
+		writeInput(nreg, error);
+		writeHolding(nreg, param);
+		setCoilBit(nreg, 1);
+	}
 }
 
-// check received message for duplicate
-static bool_t msgReceived(MESSAGE_T *msg) {
-	uint8_t idx = MAXSENSORS;
-	// search received message in msgtrace
-	for (uint8_t i=0; i < msgtrace.count; i++) {
-		if (msgtrace.msgtm[i].sensorID == msg->sensorID && msgtrace.msgtm[i].sensorType == msg->sensorType &&
-				msgtrace.msgtm[i].valueType == msg->valueType && msgtrace.msgtm[i].owkey0 == msg->owkey[0]) {
-			idx = i;
-			break;
-		}
+static void cmdTimer_handler(void *arg) {
+	(void) arg;
+
+	chSysLockFromISR();
+	for (uint8_t i = 0; i < devcmdcnt; i++) {
+	  if (pdevcmd[i].cmdcnt == 0) continue;
+	  if (pdevcmd[i].delay == 0)	{
+		  chEvtBroadcastI(&cmd_src);
+	  } else if (pdevcmd[i].delay > 0) {
+		  pdevcmd[i].delay--;
+	  }
 	}
-	if (idx == MAXSENSORS) { // add message time to msgtrace
-		if (msgtrace.count < MAXSENSORS) {
-			idx = msgtrace.count;
-			msgtrace.msgtm[idx].sensorID = msg->sensorID;
-			msgtrace.msgtm[idx].sensorType = msg->sensorType;
-			msgtrace.msgtm[idx].valueType = msg->valueType;
-			msgtrace.msgtm[idx].owkey0 = msg->owkey[0];
-			msgtrace.msgtm[idx].sysTime = chTimeNow();
-			msgtrace.count = idx+1;
-		}
-		return FALSE;
-	}
-	if ((chTimeNow() - msgtrace.msgtm[idx].sysTime) < S2ST(MSGDUPTIME)) {
-		msgtrace.msgtm[idx].sysTime = chTimeNow();
-		return TRUE;
-	}
-	msgtrace.msgtm[idx].sysTime = chTimeNow();
-	return FALSE;
+	chVTSetI(&cmdTimer, MS2ST(CMDTIMERINT), cmdTimer_handler, 0);
+	chSysUnlockFromISR();
 }
 
 /*
  * Triggered when the NRF24L01 triggers an interrupt
  */
 static void extcbnrf(EXTDriver *extp, expchannel_t channel) {
-  (void)extp;
-  (void)channel;
+	(void)extp;
+	(void)channel;
 
-	/*
-	 * Call interrupt handler
-	 */
-  	chSysLockFromIsr();
+  	chSysLockFromISR();
 	NRFReportIRQ();
-	chSysUnlockFromIsr();
+	chSysUnlockFromISR();
 }
 
 static const EXTConfig extcfg = {
@@ -152,76 +162,6 @@ static const EXTConfig extcfg = {
   }
 };
 
-void system_reset(void) {
-  chThdSleepMilliseconds(100);
-  NVIC_SystemReset();
-}
-
-#if USE_SHELL
-/*===========================================================================*/
-/* Command line related.                                                     */
-/*===========================================================================*/
-static Thread *shelltp = NULL;
-#define SHELL_WA_SIZE   THD_WA_SIZE(2048)
-
-static void cmd_mem(BaseSequentialStream *chp, int argc, char *argv[]) {
-  size_t n, size;
-
-  (void)argv;
-  if (argc > 0) {
-    chprintf(chp, "Usage: mem\r\n");
-    return;
-  }
-  n = chHeapStatus(NULL, &size);
-  chprintf(chp, "core free memory : %u bytes\r\n", chCoreStatus());
-  chprintf(chp, "heap fragments   : %u\r\n", n);
-  chprintf(chp, "heap free total  : %u bytes\r\n", size);
-}
-
-static void cmd_threads(BaseSequentialStream *chp, int argc, char *argv[]) {
-  static const char *states[] = {THD_STATE_NAMES};
-  Thread *tp;
-
-  (void)argv;
-  if (argc > 0) {
-    chprintf(chp, "Usage: threads\r\n");
-    return;
-  }
-  chprintf(chp, "    addr    stack prio refs     state\r\n");
-  tp = chRegFirstThread();
-  do {
-    chprintf(chp, "%.8lx %.8lx %4lu %4lu %9s %lu\r\n",
-            (uint32_t)tp, (uint32_t)tp->p_ctx.r13,
-            (uint32_t)tp->p_prio, (uint32_t)(tp->p_refs - 1),
-            states[tp->p_state]);
-//                   , (uint32_t)tp->p_time);
-    tp = chRegNextThread(tp);
-  } while (tp != NULL);
-}
-
-static void cmd_reboot(BaseSequentialStream *chp, int argc, char *argv[]){
-  (void)argv;
-  if (argc > 0) {
-    chprintf(chp, "Usage: reboot\r\n");
-    return;
-  }
-  chprintf(chp, "rebooting...\r\n");
-  chThdSleepMilliseconds(100);
-  NVIC_SystemReset();
-}
-
-static const ShellCommand commands[] = {
-  {"mem", cmd_mem},
-  {"threads", cmd_threads},
-  {"reboot", cmd_reboot},
-  {NULL, NULL}
-};
-
-static const ShellConfig shell_cfg = {
-  (BaseSequentialStream *)&SD2,
-  commands
-};
-#endif	//USE_SHELL
 
 /*===========================================================================*/
 /* Main and generic code.                                                    */
@@ -230,125 +170,404 @@ static const ShellConfig shell_cfg = {
 // BMP085 polling timer callback
 static void bmp085Timer_handler(void *arg){
 	(void)arg;
-	chSysLockFromIsr();
+	chSysLockFromISR();
 	chBSemSignalI(&bmp085sem);
 	chVTSetI(&bmp085Timer, S2ST(BMP085_POLL_S), bmp085Timer_handler, 0);
-	chSysUnlockFromIsr();
+	chSysUnlockFromISR();
 }
 
 /*
  * BMP085 polling thread
  */
-static WORKING_AREA(waBMP085Thread, 256);
-__attribute__((noreturn))
-static msg_t BMP085Thread(void *arg) {
-  (void)arg;
-  chRegSetThreadName("BMP085Thd");
-  while (TRUE) {
-    chBSemWait(&bmp085sem);
+static THD_WORKING_AREA(waBMPPollThread, 256);
+static THD_FUNCTION(BMPPollThread, arg) {
+	(void)arg;
+	chRegSetThreadName("BMPPollThd");
 
-    int16_t temperature;
-    uint32_t pressure;
-    uint8_t readcnt = BMP085_TRYCNT;
-    while (readcnt-- > 0) {
-    	if (bmp085_read(&temperature, &pressure) == BMP085_OK) {
-#if DEBUG
-    		sprintf(line,"SENSOR:0:BMP085:1:TEMPERATURE:%.2f", (float)temperature/10);
-    		pcPutLine(line);
-#endif
-    		writeInputReg(BMP085_TEMPERATURE, (float)temperature);
-#if DEBUG
-    		sprintf(line,"SENSOR:0:BMP085:1:PRESSURE:%.2f", (float)pressure*75/10000);
-    		pcPutLine(line);
-#endif
-    		writeInputReg(BMP085_PRESSURE, (float)pressure*75/1000);
-        	break;
-    }
-    else {
-#if DEBUG
-    		sprintf(line,"ERROR:0:BMP085");
-    		pcPutLine(line);
-#endif
-    		setReceivedBit(BMP085_TEMPERATURE, 1);
-    		setErrorBit(BMP085_TEMPERATURE, 1);
-    		setReceivedBit(BMP085_PRESSURE, 1);
-    		setErrorBit(BMP085_PRESSURE, 1);
-    	}
-    }
-  }
+	while (TRUE) {
+		chBSemWait(&bmp085sem);
+
+		int16_t temperature;
+		uint32_t pressure;
+		int16_t nreg;
+		bmp085_error_t ret = bmp085_read(&temperature, &pressure);
+		if (ret == BMP085_OK) {
+			nreg = mbmap_nreg(0, BMP085_TEMPERATURE, DEV_INT);
+			if (nreg >= 0)
+			  writeHoldingRound(nreg, (float)temperature);
+			nreg = mbmap_nreg(0, BMP085_PRESSURE, DEV_INT);
+			if (nreg >= 0)
+			  writeHoldingRound(nreg, (float)pressure*75/1000);
+		}
+		else {
+			nreg = mbmap_nreg(0, BMP085_TEMPERATURE, DEV_INT);
+			if (nreg >= 0) {
+				setDiscreteBit(nreg, 1);
+				writeInput(nreg, ret);
+				setCoilBit(nreg, 1);
+			}
+			nreg = mbmap_nreg(0, BMP085_PRESSURE, DEV_INT);
+			if (nreg >= 0) {
+				setDiscreteBit(nreg, 1);
+				writeInput(nreg, ret);
+				setCoilBit(nreg, 1);
+			}
+		}
+	} //while
 }
 
-#if 0
-#define SEND_TIMEOUT		2000
-static BinarySemaphore nrfsem;
+static THD_WORKING_AREA(waEventThread, 384);
+static THD_FUNCTION(eventThread, arg) {
+	(void)arg;
+	event_listener_t event_el;
 
-static WORKING_AREA(waNRFSendThread,1024);
-static Thread *nrfSendThread_p;
-__attribute__((noreturn))
-static msg_t nrfSendThread(void *arg) {
+	chRegSetThreadName("evtThd");
 
-  (void)arg;
-  chRegSetThreadName("nrfSend");
+	chEvtObjectInit(&event_src);
+	chEvtRegister(&event_src, &event_el, 0);
 
-  while (TRUE) {
-	MESSAGE_T *req;
-	Thread *tp;
+	for (uint8_t i = 0; i < devcmdcnt; i++) {
+		chMBObjectInit(&pdevcmd[i].mb_cmd_free, (msg_t *) pdevcmd[i].cmd_free, NRF_CMD_BUFFERS);
+		chMBObjectInit(&pdevcmd[i].mb_cmd_fill, (msg_t *) pdevcmd[i].cmd_fill, NRF_CMD_BUFFERS);
 
-	/* wait for send request */
-	tp = chMsgWait();
-	req = (MESSAGE_T *) chMsgGet(tp);
-	chMsgRelease(tp, (msg_t) req);
+		// fill cmd buffers mailbox
+		for (uint8_t j=0; j < NRF_CMD_BUFFERS; j++)
+			chMBPost(&pdevcmd[i].mb_cmd_free, (msg_t) &pdevcmd[i].nrf_cmd_buf[j], TIME_IMMEDIATE);
+	}
 
-	chBSemWait(&nrfsem);
-	NRFSendData((uint8_t *)&req);
-	chBSemSignal(&nrfsem);
-  }
+	while (TRUE) {
+		chEvtWaitAny(EVENT_MASK(0));
+
+		chSysLock();
+	    eventflags_t flags = chEvtGetAndClearFlagsI(&event_el);
+	    chSysUnlock();
+
+	    // NRF incoming message event
+	    if (flags & EVT_MSGIN) {
+			for (uint8_t i = 0; i < devcmdcnt; i++) {
+			  if (pdevcmd[i].deviceID == prcvMsg->deviceID && pdevcmd[i].cmdcnt > 0) {
+				  pdevcmd[i].delay = CMDDELAY;
+				  break;
+			  }
+			}
+	    }
+
+	    // Modbus coil write event
+	    if (flags & EVT_MBCOIL) {
+	    	mb_devmap_t mb_device;
+
+	    	uint16_t regIndex = 0;
+            for (uint16_t i = 0; i < usSCoilLen; i++) {
+            	if (pucSChgCoilBuf[i] > 0) {
+            		uint16_t word = ((uint16_t) pucSChgCoilBuf[i]) << 8;
+            		for (uint8_t j = 1; j <= 8; j++) {
+            			if (regIndex >= usSNRegs) break;
+            			if ((word >> j & 0x0080) && regIndex % 2 && getCoilBit(regIndex)) {
+            				if (mbmap_search(regIndex, &mb_device) && readHolding(regIndex) > 0) {
+            					if (mb_device.type == DEV_INT && mb_device.addr == GATE_CONFIG) {
+            					  // command to gate
+            					  executeCmd4Gate(readHolding(regIndex), readHolding(regIndex-1));
+								  setCoilBit(regIndex, 0);
+            					} else if (mb_device.type == DEV_EXT && mb_device.cmd == CMD_DELAY) {
+								  // post command to mailbox & wait device message before send
+								  void *pbuf;
+								  CMD_T cmd = {
+									deviceID : mb_device.id,
+									address : mb_device.addr,
+									command : readHolding(regIndex),
+									param : readHolding(regIndex-1),
+								  };
+								  uint8_t devidx;
+								  if (devcmd_search(mb_device.id, &devidx) &&
+									  chMBFetch(&pdevcmd[devidx].mb_cmd_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == MSG_OK) {
+									  memcpy(pbuf, &cmd, CMDLEN);
+									  if (chMBPost(&pdevcmd[devidx].mb_cmd_fill, (msg_t) pbuf, TIME_IMMEDIATE) == MSG_OK) {
+										  setCoilBit(regIndex, 0);
+										  pdevcmd[devidx].cmdcnt++;
+										  pdevcmd[devidx].delay = -1;
+										  writeInput(regIndex, pdevcmd[devidx].cmdcnt);
+									  }
+								  } else {
+									  gate_error(GATE_CMD_OVRF, 0);
+								  }
+
+            					} else if (mb_device.type == DEV_EXT && mb_device.cmd == CMD_RUN) {
+  								  // send command to device immediately
+            					  MESSAGE_T sndmsg;
+           						  memset(&sndmsg, 0, MSGLEN);
+           						  sndmsg.msgType = SENSOR_CMD;
+           						  sndmsg.deviceID = mb_device.id;
+           						  sndmsg.address = mb_device.addr;
+           						  sndmsg.command = readHolding(regIndex);
+           						  sndmsg.data.iValue = readHolding(regIndex-1);
+
+           						  void *pbuf;
+           						  if (chMBFetch(&mb_send_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == MSG_OK) {
+           							  memcpy(pbuf, &sndmsg, MSGLEN);
+           							  if (chMBPost(&mb_send_fill, (msg_t) pbuf, TIME_IMMEDIATE) == MSG_OK)
+           								  setCoilBit(regIndex, 0);
+           						  } else {
+           							  gate_error(GATE_SEND_OVRF, mb_device.id);
+           						  }
+            					}
+            				} // mbmap_search()
+            			}
+            			regIndex++;
+            		}
+            	} else {
+            		regIndex += 8;
+            	}
+            }
+
+	    }
+
+	} //while
 }
-#endif
 
-static WORKING_AREA(waNRFReceiveThread, 256);
-__attribute__((noreturn))
-static msg_t nrfReceiveThread(void *arg) {
+static THD_WORKING_AREA(waNRFSendThread, 384);
+static THD_FUNCTION(nrfSendThread, arg) {
+	(void)arg;
+	chRegSetThreadName("nrfSend");
+
+	chMBObjectInit(&mb_send_free, (msg_t*) send_free, NRF_SEND_BUFFERS);
+	chMBObjectInit(&mb_send_fill, (msg_t*) send_fill, NRF_SEND_BUFFERS);
+
+	// fill free buffers mailbox
+	for (uint8_t i=0; i < NRF_SEND_BUFFERS; i++)
+		chMBPost(&mb_send_free, (msg_t) &nrf_send_buf[i], TIME_IMMEDIATE);
+
+	while (TRUE) {
+		MESSAGE_T msg;
+		MESSAGE_T *pbuf;
+		uint8_t device_id;
+		if (chMBFetch(&mb_send_fill, (msg_t *) &pbuf, TIME_INFINITE) == MSG_OK) {
+			memcpy(&msg, pbuf, MSGLEN);
+			chMBPost(&mb_send_free, (msg_t) pbuf, TIME_IMMEDIATE);
+		} else {
+			continue;
+		}
+
+		device_id = msg.deviceID;
+		if (nrfSndAddr[NRF_ADDR_LEN-1] != device_id) {
+			nrfSndAddr[NRF_ADDR_LEN-1] = device_id;
+			NRFChangeSendAddr(nrfSndAddr, NRF_ADDR_LEN);
+		}
+
+#if USE_AES
+		MESSAGE_T aesmsg;
+		AES128_ECB_encrypt((uint8_t*) &msg, aes_key, (uint8_t*) &aesmsg);
+		memcpy(&msg, &aesmsg, MSGLEN);
+#endif
+		uint8_t sendcnt = NRFSEND_MAX;
+		while (!NRFSendData((uint8_t *) &msg) && --sendcnt);
+
+		if (sendcnt == 0) {
+			// set nRF24L01 send error
+			gate_error(GATE_SEND_TIMEOUT, device_id);
+		}
+	}
+}
+
+static THD_WORKING_AREA(waCmdThread, 256);
+static THD_FUNCTION(cmdThread, arg) {
+	(void)arg;
+	event_listener_t cmd_el;
+
+	chRegSetThreadName("cmdThd");
+
+	chEvtObjectInit(&cmd_src);
+	chEvtRegister(&cmd_src, &cmd_el, 0);
+
+	while (TRUE) {
+		chEvtWaitAny(EVENT_MASK(0));
+
+	    // send command to device flag
+		for (uint8_t i = 0; i < devcmdcnt; i++) {
+		  if (pdevcmd[i].cmdcnt > 0 && pdevcmd[i].delay == 0)	{
+			  CMD_T *pcmd;
+			  if (chMBFetch(&pdevcmd[i].mb_cmd_fill, (msg_t *) &pcmd, TIME_INFINITE) == MSG_OK) {
+				  chMBPost(&pdevcmd[i].mb_cmd_free, (msg_t) pcmd, TIME_IMMEDIATE);
+				  pdevcmd[i].cmdcnt--;
+				  pdevcmd[i].delay = -1;
+
+				  if (pdevcmd[i].cmdcnt > 0) {
+					  pdevcmd[i].delay = CMDDELAY;
+				  }
+
+				  int16_t nreg = mbmap_nreg(pcmd->deviceID, pcmd->address, DEV_EXT);
+				  if (nreg >= 0)
+					  writeInput(nreg+1, pdevcmd[i].cmdcnt);
+
+				  MESSAGE_T sndmsg;
+				  memset(&sndmsg, 0, MSGLEN);
+				  sndmsg.msgType = SENSOR_CMD;
+				  sndmsg.deviceID = pcmd->deviceID;
+				  sndmsg.address = pcmd->address;
+				  sndmsg.command = pcmd->command;
+				  sndmsg.data.iValue = pcmd->param;
+
+				  void *pbuf;
+				  if (chMBFetch(&mb_send_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == MSG_OK) {
+					  memcpy(pbuf, &sndmsg, MSGLEN);
+					  chMBPost(&mb_send_fill, (msg_t) pbuf, TIME_IMMEDIATE);
+				  } else {
+					  gate_error(GATE_SEND_OVRF, 0);
+				  }
+			  }
+		  }
+		}
+	} //while
+}
+
+static void parseSensorInfo(MESSAGE_T *msg) {
+	int16_t nreg;
+
+	if (msg->msgType != SENSOR_INFO)
+		return;
+
+	nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	if (nreg >= 0) {
+		writeHolding(nreg, (int16_t) msg->data.iValue);
+		setDiscreteBit(nreg, 0);
+		setCoilBit(nreg, 1);
+	}
+}
+
+static void parseSensorData(MESSAGE_T *msg) {
+	int16_t nreg;
+
+	if (msg->msgType != SENSOR_DATA)
+		return;
+
+	switch (msg->sensorType) {
+	case DS1820:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		   writeHoldingRound(nreg, (float)msg->data.iValue);
+	  }
+	  break;
+	case BH1750:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0)
+		  writeHoldingRound(nreg, (float)msg->data.iValue * 10);
+	  break;
+	case DHT:
+	  if (msg->valueType == TEMPERATURE) {
+		  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+		  if (nreg >= 0)
+			  writeHoldingRound(nreg, (int16_t)msg->data.iValue);
+	  } else if (msg->valueType == HUMIDITY) {
+		  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+		  if (nreg >= 0)
+			  writeHoldingRound(nreg, (int16_t)msg->data.iValue);
+	  }
+	  break;
+	default:	//UNKNOWN SENSOR
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  writeHolding(nreg, (int16_t) msg->data.iValue);
+		  setDiscreteBit(nreg, 0);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	}
+
+}
+
+static void parseSensorError(MESSAGE_T *msg) {
+	int16_t nreg;
+
+	if (msg->msgType != SENSOR_ERROR)
+		return;
+
+	switch (msg->sensorType) {
+	case DS1820:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	case BH1750:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	case DHT:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	case ADC:
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	default:	// UNKNOWN ERROR
+	  nreg = mbmap_nreg(msg->deviceID, msg->address, DEV_EXT);
+	  if (nreg >= 0) {
+		  setDiscreteBit(nreg, 1);
+		  writeInput(nreg, (uint8_t) msg->error);
+		  setCoilBit(nreg, 1);
+	  }
+	  break;
+	}
+
+}
+
+static THD_WORKING_AREA(waNRFReceiveThread, 256);
+static THD_FUNCTION(nrfReceiveThread, arg) {
   (void)arg;
   chRegSetThreadName("nrfReceive");
 
-  uint8_t pipeNr=0;
+  chMBObjectInit(&mb_read_free, (msg_t*) read_free, NRF_READ_BUFFERS);
+  chMBObjectInit(&mb_read_fill, (msg_t*) read_fill, NRF_READ_BUFFERS);
 
+  // fill free buffers mailbox
   for (uint8_t i=0; i < NRF_READ_BUFFERS; i++)
 	  chMBPost(&mb_read_free, (msg_t) &nrf_read_buf[i], TIME_IMMEDIATE);
 
   while (TRUE) {
+	  uint8_t pipeNr;
+	  uint8_t inbuf[MSGLEN+1];
+
 	  chBSemWait(&nrf.NRFSemRX);
-	  uint8_t inbuf[sizeof(MESSAGE_T)+1] = {0};
+	  memset(&inbuf, 0, MSGLEN+1);
 	  NRFReceiveData(&pipeNr, inbuf);
 
-#if 0	// TODO: send answer to client
-	  chMsgSend(nrfSendThread_p, (msg_t) msg);
-
-	  /* wait for reply */
-	  if(chBSemWaitTimeout(&nrfsem, MS2ST(SEND_TIMEOUT)) == RDY_TIMEOUT) {
-		  chBSemReset(&nrfsem, FALSE);
-	  }
-#endif
+	  if (pipeNr != 1) continue;
 
 	  void *pbuf;
-	  if (chMBFetch(&mb_read_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == RDY_OK) {
-		  memcpy(pbuf, inbuf, sizeof(MESSAGE_T));
+	  if (chMBFetch(&mb_read_free, (msg_t *) &pbuf, TIME_IMMEDIATE) == MSG_OK) {
+		  memcpy(pbuf, inbuf, MSGLEN);
 		  chMBPost(&mb_read_fill, (msg_t) pbuf, TIME_IMMEDIATE);
+	  } else {
+		  gate_error(GATE_READ_OVRF, 0);
 	  }
 
   }
 }
 
-static WORKING_AREA(waNRFParseThread, 256);
-__attribute__((noreturn))
-static msg_t nrfParseThread(void *arg) {
+static THD_WORKING_AREA(waNRFParseThread, 256);
+static THD_FUNCTION(nrfParseThread, arg) {
   (void)arg;
   chRegSetThreadName("nrfParse");
-
-#if AES
-  uint8_t mbuf[16];
-#endif
 
 #if DEBUG
   char line[60], stype[7];
@@ -357,130 +576,297 @@ static msg_t nrfParseThread(void *arg) {
 
   while (TRUE) {
 	  void *pbuf;
-	  if (chMBFetch(&mb_read_fill, (msg_t *) &pbuf, TIME_INFINITE) == RDY_OK) {
-	     chMBPost(&mb_read_free, (msg_t) pbuf, TIME_IMMEDIATE);
+
+	  if (chMBFetch(&mb_read_fill, (msg_t *) &pbuf, TIME_INFINITE) == MSG_OK) {
+		  memcpy(&rcvmsg, pbuf, MSGLEN);
+		  chMBPost(&mb_read_free, (msg_t) pbuf, TIME_IMMEDIATE);
 	  } else {
 		  continue;
 	  }
 
-	  MESSAGE_T *msg = (MESSAGE_T *)pbuf;
 
-#if AES
-	  aes_decrypt_ecb(&aes_data, pbuf, mbuf);
-	  msg = (MESSAGE_T *)mbuf;
-#endif
-
-#if 0
-	  if (msgReceived(msg)) continue;
+#if USE_AES
+	  AES128_ECB_decrypt(pbuf, aes_key, (uint8_t*) &rcvmsg);
+#else
+	  memcpy(&rcvmsg, pbuf, MSGLEN);
 #endif
 
-	  switch (msg->msgType) {
-	  case SENSOR_DATA:	//SENSOR
-		  switch (msg->sensorType) {
-		  case DS1820:
-#if DEBUG
-			  owkey_hexstr(msg->owkey, owkey);
-			  sprintf(line,"SENSOR:%d:DS1820:%s:TEMPERATURE:%.2f", msg->sensorID, owkey, (float)msg->data.fValue);
-			  pcPutLine(line);
-#endif
-			  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, (float)msg->data.fValue * 10);
-			  break;
-		  case BH1750:
-#if DEBUG
-			  sprintf(line,"SENSOR:%d:BH1750:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
-			  pcPutLine(line);
-#endif
-			  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, (float)msg->data.iValue * 10);
-			  break;
-		  case DHT:
-			  if (msg->valueType == TEMPERATURE){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:DHT:%d:TEMPERATURE:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
-				  pcPutLine(line);
-#endif
-				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, (float)msg->data.iValue);
-			  } else if (msg->valueType == HUMIDITY){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:DHT:%d:HUMIDITY:%.2f", msg->sensorID, msg->owkey[0], (float)msg->data.iValue/10);
-				  pcPutLine(line);
-#endif
-				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, (float)msg->data.iValue);
-			  }
-			  break;
-		  case BMP085:
-			  if (msg->valueType == TEMPERATURE){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:BMP085:1:TEMPERATURE:%.2f", msg->sensorID, (float)msg->data.fValue/10);
-				  pcPutLine(line);
-#endif
-			  } else if (msg->valueType == PRESSURE){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:BMP085:1:PRESSURE:%.2f", msg->sensorID, (float)msg->data.fValue*75/10000);
-				  pcPutLine(line);
-#endif
-			  }
-			  break;
-		  case ADC:
-			  if (msg->valueType == LIGHT){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:ADC:1:LIGHT:%d", msg->sensorID, (int)msg->data.iValue);
-				  pcPutLine(line);
-#endif
-				  writeInputReg((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, (float)msg->data.iValue * 10);
-			  } else if (msg->valueType == VOLTAGE){
-#if DEBUG
-				  sprintf(line,"SENSOR:%d:ADC:1:VOLTAGE:%d", msg->sensorID, (int)msg->data.iValue);
-				  pcPutLine(line);
-#endif
-			  }
-			  break;
-		  default:	//UNKNOWN
-#if DEBUG
-			  sprintf(line,"SENSOR:%d:ERROR:unknown sensor type", msg->sensorID);
-			  pcPutLine(line);
-#endif
-			  break;
-		  }
+	  chEvtBroadcastFlags(&event_src, EVT_MSGIN);
+
+	  switch (prcvMsg->msgType) {
+	  case SENSOR_INFO:
+		  parseSensorInfo(prcvMsg);
+		  break;
+	  case SENSOR_DATA:
+		  parseSensorData(prcvMsg);
 		  break;
 	  case SENSOR_ERROR:
-		  switch (msg->sensorType) {
-		  case DS1820:
-			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, 1);
-			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DS18B20_TEMPERATURE, 1);
-			  break;
-		  case BH1750:
-			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
-			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
-			  break;
-		  case DHT:
-			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, 1);
-			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_TEMPERATURE, 1);
-			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, 1);
-			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + DHT_HUMIDITY, 1);
-			  break;
-		  case ADC:
-			  setReceivedBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
-			  setErrorBit((1 + msg->sensorID) * NRF_SENSOR_REGS + BH1750_LIGHT, 1);
-			  break;
-		  default:
-			  break;
-		  }
-#if DEBUG
-		  memset(&stype,0,7);
-		  if (get_sensor_type(msg->sensorType, stype)) {
-			  sprintf(line,"ERROR:%d:%s:%d:%d", msg->sensorID, stype, msg->owkey[0], msg->data.cValue[0]);
-			  pcPutLine(line);
-		  }
-#endif
+		  parseSensorError(prcvMsg);
 		  break;
 	  default:
-#if DEBUG
-		  sprintf(line,"ERROR:%d:unknown message type", msg->sensorID);
-		  pcPutLine(line);
-#endif
 		  break;
 	  }
   } // while
+}
+
+static void default_config(void) {
+	  config.magic = MAGIC;
+	  config.mb_addr = MB_ADDR;
+	  config.mb_bitrate = MB_BITRATE;
+	  config.mb_parity = MB_PARITY_NONE;
+	  memcpy(config.nrfaddr_rcv, nrfRcvAddr, NRF_ADDR_LEN);
+	  memcpy(config.nrfadrr_snd, nrfSndAddr, NRF_ADDR_LEN);
+	  config.bmp085_poll = BMP085_POLL_S;
+	  memset(&config.devmap, 0, sizeof(mb_devmap_t) * MAXDEV);
+	  mb_devmap_t* dev;
+	  dev = &config.devmap[0];
+	  dev->id = 0;
+	  dev->type = DEV_INT;
+	  dev->cmd = CMD_RUN;
+	  dev->addr = 4;
+	  dev = &config.devmap[1];
+	  dev->id = 0;
+	  dev->type = DEV_EXT;
+	  dev->cmd = CMD_DELAY;
+	  dev->addr = 8;
+	  dev = &config.devmap[2];
+	  dev->id = 1;
+	  dev->type = DEV_EXT;
+	  dev->cmd = CMD_DELAY;
+	  dev->addr = 8;
+	  dev = &config.devmap[3];
+	  dev->id = 2;
+	  dev->type = DEV_EXT;
+	  dev->cmd = CMD_DELAY;
+	  dev->addr = 8;
+	  dev = &config.devmap[4];
+	  dev->id = 3;
+	  dev->type = DEV_EXT;
+	  dev->cmd = CMD_DELAY;
+	  dev->addr = 8;
+	  dev = &config.devmap[5];
+	  dev->id = 10;
+	  dev->type = DEV_EXT;
+	  dev->cmd = CMD_DELAY;
+	  dev->addr = 11;
+}
+
+static uint8_t write_config(void) {
+	uint8_t cfgbuf[CFGLEN+1];
+
+	memcpy(&cfgbuf, &config, CFGLEN);
+	cfgbuf[CFGLEN] = CRC8((uint8_t*) &config, CFGLEN);
+
+	uint8_t ret = eepromWrite((uint8_t*) &cfgbuf, CFGLEN+1);
+	if (ret != EEPROM_OK) {
+		// eeprom configuration write fail
+		return false;
+	}
+	return true;
+}
+
+// execute command to gateway
+static void executeCmd4Gate(uint16_t command, uint16_t param) {
+	uint8_t cmd, addr;
+
+	cmd = command & 0x00FF;
+	addr = command >> 8;
+
+	int16_t nreg = mbmap_nreg(0, GATE_CONFIG, DEV_INT);
+	if (nreg < 0) return;
+
+	switch (cmd) {
+	  case CMD_RESET:
+		// board reset
+		if (addr == GATE_REG_CMD && param == MAGIC) {
+	    	cmd_flag = GATE_CMD_RESTART;
+		} else {
+			gate_error(GATE_CMD_ERROR, 0);
+		}
+		break;
+	  case CMD_CFGWRITE:
+		// write configuration to eeprom
+		if (addr == GATE_REG_CMD && param == MAGIC) {
+	    	cmd_flag = GATE_CMD_CFGWRITE;
+		} else {
+			gate_error(GATE_CMD_ERROR, 0);
+		}
+		break;
+	  case CMD_GETREG:
+		// read config register value
+		if (addr > REGLEN) {
+			gate_error(GATE_CMD_PARAM, 0);
+			break;
+		}
+		switch (addr) {
+			case GATE_MB_ADDR:
+				writeInput(nreg, config.mb_addr);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_MB_BITRATE:
+				writeInput(nreg, config.mb_bitrate);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_MB_PARITY:
+				writeInput(nreg, config.mb_parity);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_BMP085_POLL:
+				writeInput(nreg, config.bmp085_poll);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR0:
+				writeInput(nreg, config.nrfaddr_rcv[0]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR1:
+				writeInput(nreg, config.nrfaddr_rcv[1]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR2:
+				writeInput(nreg, config.nrfaddr_rcv[2]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR3:
+				writeInput(nreg, config.nrfaddr_rcv[3]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR4:
+				writeInput(nreg, config.nrfaddr_rcv[4]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR0:
+				writeInput(nreg, config.nrfadrr_snd[0]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR1:
+				writeInput(nreg, config.nrfadrr_snd[1]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR2:
+				writeInput(nreg, config.nrfadrr_snd[2]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR3:
+				writeInput(nreg, config.nrfadrr_snd[3]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR4:
+				writeInput(nreg, config.nrfadrr_snd[4]);
+				setCoilBit(nreg, 1);
+				break;
+			default:
+				if (addr >= GATE_DEV_MAP) {
+					uint8_t* pdevmap = (uint8_t*) config.devmap;
+					writeInput(nreg, pdevmap[addr - GATE_DEV_MAP]);
+					setCoilBit(nreg, 1);
+				}
+				break;
+		}
+		break;
+	  case CMD_SETREG:
+		// set config register value
+		if (addr > REGLEN) {
+			gate_error(GATE_CMD_PARAM, 0);
+			break;
+		}
+		switch (addr) {
+			case GATE_MB_ADDR:
+				if (param > 0 && param < 254) {
+					config.mb_addr = param;
+					writeInput(nreg, config.mb_addr);
+					setCoilBit(nreg, 1);
+				} else {
+					gate_error(GATE_CMD_PARAM, 0);
+				}
+				break;
+			case GATE_MB_BITRATE:
+				if (param <= MB_BR_115200) {
+					config.mb_bitrate = param;
+					writeInput(nreg, config.mb_bitrate);
+					setCoilBit(nreg, 1);
+				} else {
+					gate_error(GATE_CMD_PARAM, 0);
+				}
+				break;
+			case GATE_MB_PARITY:
+				if (param <= MB_PARITY_EVEN) {
+					config.mb_parity = param;
+					writeInput(nreg, config.mb_parity);
+					setCoilBit(nreg, 1);
+				} else {
+					gate_error(GATE_CMD_PARAM, 0);
+				}
+				break;
+			case GATE_BMP085_POLL:
+				config.bmp085_poll = param;
+				writeInput(nreg, config.bmp085_poll);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR0:
+				config.nrfaddr_rcv[0] = param & 0x00FF;
+				writeInput(nreg, config.nrfaddr_rcv[0]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR1:
+				config.nrfaddr_rcv[1] = param & 0x00FF;
+				writeInput(nreg, config.nrfaddr_rcv[1]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR2:
+				config.nrfaddr_rcv[2] = param & 0x00FF;
+				writeInput(nreg, config.nrfaddr_rcv[2]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR3:
+				config.nrfaddr_rcv[3] = param & 0x00FF;
+				writeInput(nreg, config.nrfaddr_rcv[3]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_RCVADDR4:
+				config.nrfaddr_rcv[4] = param & 0x00FF;
+				writeInput(nreg, config.nrfaddr_rcv[4]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR0:
+				config.nrfadrr_snd[0] = param & 0x00FF;
+				writeInput(nreg, config.nrfadrr_snd[0]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR1:
+				config.nrfadrr_snd[1] = param & 0x00FF;
+				writeInput(nreg, config.nrfadrr_snd[1]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR2:
+				config.nrfadrr_snd[2] = param & 0x00FF;
+				writeInput(nreg, config.nrfadrr_snd[2]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR3:
+				config.nrfadrr_snd[3] = param & 0x00FF;
+				writeInput(nreg, config.nrfadrr_snd[3]);
+				setCoilBit(nreg, 1);
+				break;
+			case GATE_NRF_SNDADDR4:
+				config.nrfadrr_snd[4] = param & 0x00FF;
+				writeInput(nreg, config.nrfadrr_snd[4]);
+				setCoilBit(nreg, 1);
+				break;
+			default:
+				if (addr >= GATE_DEV_MAP) {
+					uint8_t* pdevmap = (uint8_t*) config.devmap;
+					pdevmap[addr - GATE_DEV_MAP] = param & 0x00FF;
+					writeInput(nreg, pdevmap[addr - GATE_DEV_MAP]);
+					setCoilBit(nreg, 1);
+				}
+				break;
+		}
+		break;
+	  default:
+		gate_error(GATE_CMD_ERROR, 0);
+		break;
+	}
 }
 
 // called on kernel panic
@@ -507,6 +893,9 @@ int main(void) {
   halInit();
   chSysInit();
 
+  // LED pin PAL mode
+  palSetPadMode(LED_GPIO, LED_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+
 #if DEBUG
   // serial port for slave MCU read/write
   sdStart(&SD2, NULL);
@@ -515,16 +904,57 @@ int main(void) {
   chBSemInit(&mcusem, FALSE);
 
   char line[60];
-  sprintf(line, "\r\nnRF24 wireless gateway, F/W: %d", FIRMWARE);
+  sprintf(line, "\r\nnRF24 modbus gateway, F/W: %d", FIRMWARE);
   pcPutLine(line);
 #endif
 
-#if USE_SHELL
   /*
-   * Shell manager initialization.
+   * Configuration related
    */
-  shellInit();
+#if 1
+  uint8_t cfgbuf[CFGLEN+1];
+  eepromInit();
+  if (eepromRead(cfgbuf, CFGLEN+1) != EEPROM_OK) {
+	  // eeprom configuration read fail
+	  port_halt();
+  }
+  memcpy(&config, &cfgbuf, CFGLEN);
+
+  if (config.magic != MAGIC || CRC8((uint8_t*) &config, CFGLEN) != cfgbuf[CFGLEN]) {
+	  // eeprom configuration wrong
+	  default_config();
+	  if (! write_config()) {
+		  port_halt();
+	  }
+  }
+#else
+  default_config();
 #endif
+
+  devcmdcnt = 0;
+  for (uint8_t i = 0; i < MAXDEV; i++) {
+	  if (config.devmap[i].cmd == CMD_DELAY)
+		  devcmdcnt++;
+  }
+  if (devcmdcnt > 0) {
+	  // memory allocate
+	  pdevcmd = (DEVCMD_T*) chHeapAlloc(NULL, sizeof(DEVCMD_T) * devcmdcnt);
+	  if (pdevcmd == NULL) port_halt();
+	  memset(pdevcmd, 0, sizeof(DEVCMD_T) * devcmdcnt);
+	  // fill device command array
+	  uint8_t cnt = 0;
+	  for (uint8_t i = 0; i < MAXDEV; i++) {
+		  if (config.devmap[i].cmd == CMD_DELAY) {
+			  pdevcmd[cnt].deviceID = config.devmap[i].id;
+			  pdevcmd[cnt++].delay = CMDDELAY;
+		  }
+	  }
+	  // start command delay timer
+	  chVTSet(&cmdTimer, MS2ST(CMDTIMERINT), cmdTimer_handler, 0);
+  }
+
+  // event thread
+  chThdCreateStatic(waEventThread, sizeof(waEventThread), NORMALPRIO+2, eventThread, NULL);
 
   // Setup NRF24L01 IRQ pad.
   palSetPadMode(NRF_PORT_CE_IRQ, NRF_PORT_IRQ, PAL_MODE_INPUT);
@@ -542,38 +972,6 @@ int main(void) {
    */
   NRFInit();
 
-  // send thread over NRF24L01+
-  //nrfSendThread_p = chThdCreateStatic(waNRFSendThread, sizeof(waNRFSendThread), NORMALPRIO, nrfSendThread, NULL);
-
-  chMBInit(&mb_read_free, (msg_t*) read_free, NRF_READ_BUFFERS);
-  chMBInit(&mb_read_fill, (msg_t*) read_fill, NRF_READ_BUFFERS);
-
-  // message receive thread from NRF24L01+
-  chThdCreateStatic(waNRFReceiveThread, sizeof(waNRFReceiveThread), NORMALPRIO+1, nrfReceiveThread, NULL);
-
-  // message parse thread from NRF24L01+
-  chThdCreateStatic(waNRFParseThread, sizeof(waNRFParseThread), NORMALPRIO, nrfParseThread, NULL);
-
-#if AES
-  aes_initialize(&aes_data, AES_KEY_LENGTH_128_BITS, aes_key, NULL);
-#endif
-
-  // BMP085 driver init
-  bmp085_init();
-
-  // BMP085 polling semaphore
-  chBSemInit(&bmp085sem, FALSE);
-
-  // start BMP085 polling timer
-  chVTSet(&bmp085Timer, S2ST(BMP085_POLL_S), bmp085Timer_handler, 0);
-
-  chThdCreateStatic(waBMP085Thread, sizeof(waBMP085Thread), NORMALPRIO, BMP085Thread, NULL);
-
-  /*
-   * Creates the MODBUS thread.
-   */
-  createModbusThd();
-
 #if DEBUG
   uint8_t txaddr[5], rxaddr[5], rxaddrstr[11] = {'\0'}, txaddrstr[11] = {'\0'};
   NRFGetAddrs(txaddr, rxaddr);
@@ -583,30 +981,79 @@ int main(void) {
   pcPutLine(line);
 #endif
 
-  // LED pin PAL mode
-  palSetPadMode(LED_GPIO, LED_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+  // message receive thread from NRF24L01+
+  chThdCreateStatic(waNRFReceiveThread, sizeof(waNRFReceiveThread), NORMALPRIO+1, nrfReceiveThread, NULL);
 
-  writeInputReg(FIRMWARE_VERSION, FIRMWARE);
+  // received message parse thread
+  chThdCreateStatic(waNRFParseThread, sizeof(waNRFParseThread), NORMALPRIO, nrfParseThread, NULL);
+
+  // message send thread over NRF24L01+
+  chThdCreateStatic(waNRFSendThread, sizeof(waNRFSendThread), NORMALPRIO+1, nrfSendThread, NULL);
+
+  // command queue parse thread
+  chThdCreateStatic(waCmdThread, sizeof(waCmdThread), NORMALPRIO, cmdThread, NULL);
+
+#if USE_BMP085
+  // BMP085 driver init
+  bmp085_init();
+
+  // BMP085 polling semaphore
+  chBSemObjectInit(&bmp085sem, FALSE);
+
+  // start BMP085 polling timer
+  chVTSet(&bmp085Timer, S2ST(BMP085_POLL_S), bmp085Timer_handler, 0);
+
+  chThdCreateStatic(waBMPPollThread, sizeof(waBMPPollThread), NORMALPRIO, BMPPollThread, NULL);
+#endif
+
+  /*
+   * Creates the MODBUS thread.
+   */
+  createModbusThd();
+
+  /*
+    * IWDG start
+  */
+  iwdgInit();
+  iwdgStart(&IWDGD, &iwdgcfg);
+
+  int16_t nreg = mbmap_nreg(0, GATE_STATUS, DEV_INT);
+  if (nreg >= 0) {
+	  writeHolding(nreg+1, FIRMWARE);
+	  setCoilBit(nreg+1, 1);
+  }
+
   uint16_t dummy=0;
+  cmd_flag = GATE_CMD_NONE;
 
   /*
    * Normal main() thread activity, in this demo it does nothing except
    * sleeping in a loop and listen for events.
    */
   while (TRUE) {
-#if USE_SHELL
-    if (!shelltp)
-    	shelltp = shellCreate(&shell_cfg, SHELL_WA_SIZE, NORMALPRIO);
-    else {
-    	if (chThdTerminated(shelltp)) {
-    		chThdRelease(shelltp);    /* Recovers memory of the previous shell.   */
-    		shelltp = NULL;           /* Triggers spawning of a new shell.        */
-    	}
+    int16_t nreg = mbmap_nreg(0, GATE_STATUS, DEV_INT);
+    if (nreg >= 0) {
+		writeInput(nreg+1, dummy++);
     }
-#endif
-
-    writeInputReg(DUMMY_COUNTER, dummy++);
     palTogglePad(LED_GPIO, LED_PIN);
+
+    // reset watchdog
+    iwdgReset(&IWDGD);
+
+    switch (cmd_flag) {
+    case GATE_CMD_RESTART:
+    	palClearPad(GPIOA, GPIOA_PIN8); 	// release RS485 TX_EN pin
+    	NVIC_SystemReset();
+    	break;
+    case GATE_CMD_CFGWRITE:
+		if (! write_config()) {
+			gate_error(GATE_CFG_WRITE, 0);
+		}
+    	break;
+    default:
+    	break;
+    }
+    cmd_flag = GATE_CMD_NONE;
 
    	chThdSleepMilliseconds(1000);
   }

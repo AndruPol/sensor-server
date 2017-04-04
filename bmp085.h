@@ -25,8 +25,7 @@ extern "C" {
 // bmp085 init
 void bmp085_init(void);
 // read compensated temperature and pressure values
-//int16_t  temperature in 0.1C
-//uint32_t pressure in Pa, pressure*75/10000 in mmHg
+// temperature in 0.1C, pressure in Pa, pressure*75/10000 in mmHg
 bmp085_error_t bmp085_read(int16_t *temperature, uint32_t *pressure);
 
 #ifdef __cplusplus

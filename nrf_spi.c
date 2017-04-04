@@ -30,8 +30,6 @@
 
 #include "nrf_spi.h"
 
-#include <string.h>
-
 /*
  * SPI speed definitions.
  */
@@ -47,7 +45,7 @@
 /*
  * Mutex to lock output buffer
  */
-static Mutex					SPIMtx; /* Mutex */
+static mutex_t		SPIMtx; /* Mutex */
 
 /*
  * SPI configuration structure.
@@ -71,7 +69,7 @@ void SPIInit(void)
 	/*
 	 * Initialize Mutex
 	 */
-	chMtxInit(&SPIMtx); /* Mutex initialization before use */
+	chMtxObjectInit(&SPIMtx); /* Mutex initialization before use */
 }
 
 /*
@@ -90,7 +88,7 @@ int SPIExchangeData(SPIDriver *spip, uint8_t *tx, uint8_t *rx, size_t size) {
 	spiUnselect(spip);                /* Slave Select de-assertion.       */
 	spiReleaseBus(spip);              /* Ownership release.               */
 
-	chMtxUnlock();
+	chMtxUnlock(&SPIMtx);
 
 	return 0;
 }
@@ -112,7 +110,7 @@ int SPISendData(SPIDriver *spip, uint8_t *tx, size_t size) {
 	spiUnselect(spip);                /* Slave Select de-assertion.       */
 	spiReleaseBus(spip);              /* Ownership release.               */
 
-	chMtxUnlock();
+	chMtxUnlock(&SPIMtx);
 
 	return 0;
 }
@@ -134,7 +132,7 @@ int SPIReceiveData(SPIDriver *spip, uint8_t *rx, size_t size) {
 	spiUnselect(spip);                /* Slave Select de-assertion.       */
 	spiReleaseBus(spip);              /* Ownership release.               */
 
-	chMtxUnlock();
+	chMtxUnlock(&SPIMtx);
 
 	return 0;
 }

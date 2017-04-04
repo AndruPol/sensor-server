@@ -34,13 +34,12 @@
 
 /* ----------------------- Modbus includes ----------------------------------*/
 #include "mb.h"
-#include "mb_m.h"
 #include "mbport.h"
 #include "port.h"
 
 /* ----------------------- Defines ------------------------------------------*/
 
-#define GPTDRIVER		GPTD2
+#define GPTDRIVER		GPTD4
 #define BOARD_LED2_P	GPIOC
 #define BOARD_LED2		GPIOC_LED
 
@@ -58,10 +57,11 @@ static void timerHandler(GPTDriver *gptp);
 static const GPTConfig gptcfg = {
   100000,    	/* 100kHz timer clock.*/
   timerHandler, /* Timer callback.*/
+  0,
   0
 };
 
-static systime_t    timerout= 0;
+systime_t    timerout= 0;
 
 /* ----------------------- Start implementation -----------------------------*/
 static void timerHandler(GPTDriver *gptp)
@@ -73,103 +73,18 @@ static void timerHandler(GPTDriver *gptp)
   palSetPad (BOARD_LED2_P, BOARD_LED2);
 #endif
     
-  chSysLockFromIsr();
+  chSysLockFromISR();
   vMBPortSetWithinException (TRUE) ;
-#if MB_MASTER_RTU_ENABLED > 0 || MB_MASTER_ASCII_ENABLED > 0
-  if (pxMBMasterPortCBTimerExpired () == TRUE) {
-   	rescheduleJbus485FromIsr();
-  }
-#elif MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
+#if MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
   if (pxMBPortCBTimerExpired () == TRUE)
    	rescheduleJbus485FromIsr();
 #endif
   vMBPortSetWithinException (FALSE) ;
-  chSysUnlockFromIsr();
+  chSysUnlockFromISR();
 }
 
 
-#if MB_MASTER_RTU_ENABLED > 0 || MB_MASTER_ASCII_ENABLED > 0
-
-BOOL
-xMBMasterPortTimersInit( USHORT usTim1Timerout50us )
-{
-  timerout = usTim1Timerout50us*((500*1000)/gptcfg.frequency);
-  gptStart(&GPTDRIVER, &gptcfg);
-#ifdef DEBUG_MB
-  tmObjectInit (&tm);
-#endif
-  return TRUE;
-}
-
-void
-vMBMasterPortTimersClose( void )
-{
-   gptStop (&GPTDRIVER);
-}
-
-void
-vMBMasterPortTimersT35Enable( void )
-{
-#ifdef DEBUG_MB
-  palClearPad (BOARD_LED2_P, BOARD_LED2);
-  tmStartMeasurement (&tm);
-#endif
-  /* Set current timer mode, don't change it.*/
-  vMBMasterSetCurTimerMode(MB_TMODE_T35);
-  if (bMBPortIsWithinException() == TRUE) {
-    gptStopTimerI (&GPTDRIVER);
-    gptStartOneShotI(&GPTDRIVER, timerout);
-  } else {
-    gptStopTimer (&GPTDRIVER);
-    gptStartOneShot(&GPTDRIVER, timerout);
-  }
-}
-
-void
-vMBMasterPortTimersDisable( void )
-{
-  if (bMBPortIsWithinException() == TRUE) {
-    gptStopTimerI (&GPTDRIVER);
-  } else {
-    gptStopTimer (&GPTDRIVER);
-  }
-}
-
-void
-vMBMasterPortTimersDelay( USHORT usTimeOutMS )
-{
-  chThdSleepMicroseconds (usTimeOutMS);
-}
-
-void vMBMasterPortTimersConvertDelayEnable()
-{
-  systime_t timertm = MB_MASTER_DELAY_MS_CONVERT*((10000*1000)/gptcfg.frequency);
-  /* Set current timer mode, don't change it.*/
-  vMBMasterSetCurTimerMode(MB_TMODE_CONVERT_DELAY);
-  if (bMBPortIsWithinException() == TRUE) {
-	gptStopTimerI (&GPTDRIVER);
-	gptStartOneShotI(&GPTDRIVER, timertm);
-  } else {
-	gptStopTimer (&GPTDRIVER);
-	gptStartOneShot(&GPTDRIVER, timertm);
-  }
-}
-
-void vMBMasterPortTimersRespondTimeoutEnable()
-{
-  systime_t timertm = MB_MASTER_TIMEOUT_MS_RESPOND*((10000*1000)/gptcfg.frequency);
-  /* Set current timer mode, don't change it.*/
-  vMBMasterSetCurTimerMode(MB_TMODE_RESPOND_TIMEOUT);
-  if (bMBPortIsWithinException() == TRUE) {
-	gptStopTimerI (&GPTDRIVER);
-	gptStartOneShotI(&GPTDRIVER, timertm);
-  } else {
-	gptStopTimer (&GPTDRIVER);
-	gptStartOneShot(&GPTDRIVER, timertm);
-  }
-}
-
-#elif MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
+#if MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
 
 BOOL
 xMBPortTimersInit( USHORT usTim1Timerout50us )

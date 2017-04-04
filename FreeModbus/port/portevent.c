@@ -35,264 +35,22 @@
 
 /* ----------------------- Modbus includes ----------------------------------*/
 #include "mb.h"
-#include "mb_m.h"
 #include "mbport.h"
 #include "port.h"
 
 /* ----------------------- Variables ----------------------------------------*/
 static msg_t bufferQueue;
-static Mailbox xQueueHdl;
+static mailbox_t xQueueHdl;
 //static MAILBOX_DECL(xQueueHdl, bufferQueue, 1);
 
 
 /* ----------------------- Start implementation -----------------------------*/
-#if MB_MASTER_RTU_ENABLED > 0 || MB_MASTER_ASCII_ENABLED > 0
-
-static BinarySemaphore xMasterRunRes;
-
-BOOL
-xMBMasterPortEventInit( void )
-{
-  chMBInit(&xQueueHdl, &bufferQueue, 1);
-
-  return TRUE;
-}
-
-BOOL
-xMBMasterPortEventPost( eMBMasterEventType eEvent )
-{
-  BOOL            bStatus = TRUE;
-
-  if (bMBPortIsWithinException () == TRUE) {
-
-    if (chMBPostI (&xQueueHdl, (msg_t) eEvent) != RDY_OK)
-      bStatus = FALSE;
-
-  } else {
-
-    if (chMBPost (&xQueueHdl, (msg_t) eEvent, TIME_INFINITE) != RDY_OK)
-      bStatus = FALSE;
-  }
-
-  return bStatus;
-}
-
-BOOL
-xMBMasterPortEventGet( eMBMasterEventType * peEvent )
-{
-  if (chMBFetch (&xQueueHdl, (msg_t *) peEvent, TIME_INFINITE) != RDY_OK)
-	return FALSE;
-
-  return TRUE;
-}
-
-/**
- * This function is initialize the OS resource for modbus master.
- * Note:The resource is define by OS.If you not use OS this function can be empty.
- *
- */
-void vMBMasterOsResInit( void )
-{
-    chBSemInit(&xMasterRunRes, FALSE);
-}
-
-/**
- * This function is take Modbus Master running resource.
- * Note:The resource is define by Operating System.If you not use OS this function can be just return TRUE.
- *
- * @param lTimeOut the waiting time.
- *
- * @return resource taked result
- */
-BOOL xMBMasterRunResTake( LONG lTimeOut )
-{
-    /*If waiting time is -1 .It will wait forever */
-   	if (lTimeOut == -1)
-   		return chBSemWaitTimeout(&xMasterRunRes, TIME_INFINITE) == RDY_TIMEOUT ? FALSE : TRUE ;
-   	else
-   		return chBSemWaitTimeout(&xMasterRunRes, lTimeOut) == RDY_TIMEOUT ? FALSE : TRUE ;
-}
-
-/**
- * This function is release Modbus Master running resource.
- * Note:The resource is define by Operating System.If you not use OS this function can be empty.
- *
- */
-void vMBMasterRunResRelease( void )
-{
-    /* release resource */
-    if (bMBPortIsWithinException () == TRUE) {
-    	chBSemSignalI(&xMasterRunRes);
-    } else {
-    	chBSemSignal(&xMasterRunRes);
-    }
-}
-
-/**
- * This is modbus master respond timeout error process callback function.
- * @note There functions will block modbus master poll while execute OS waiting.
- * So,for real-time of system.Do not execute too much waiting process.
- *
- * @param ucDestAddress destination salve address
- * @param pucPDUData PDU buffer data
- * @param ucPDULength PDU buffer length
- *
- */
-void vMBMasterErrorCBRespondTimeout(UCHAR ucDestAddress, const UCHAR* pucPDUData,
-        USHORT ucPDULength) {
-    (void)ucDestAddress;
-    (void)pucPDUData;
-    (void)ucPDULength;
-	/**
-     * @note This code is use OS's event mechanism for modbus master protocol stack.
-     * If you don't use OS, you can change it.
-     */
-    if (bMBPortIsWithinException () == TRUE) {
-    	chMBPostI (&xQueueHdl, EV_MASTER_ERROR_RESPOND_TIMEOUT);
-    } else {
-    	chMBPost (&xQueueHdl, EV_MASTER_ERROR_RESPOND_TIMEOUT, TIME_IMMEDIATE);
-    }
-
-    /* You can add your code under here. */
-
-}
-
-/**
- * This is modbus master receive data error process callback function.
- * @note There functions will block modbus master poll while execute OS waiting.
- * So,for real-time of system.Do not execute too much waiting process.
- *
- * @param ucDestAddress destination salve address
- * @param pucPDUData PDU buffer data
- * @param ucPDULength PDU buffer length
- *
- */
-void vMBMasterErrorCBReceiveData(UCHAR ucDestAddress, const UCHAR* pucPDUData,
-        USHORT ucPDULength) {
-    (void)ucDestAddress;
-    (void)pucPDUData;
-    (void)ucPDULength;
-    /**
-     * @note This code is use OS's event mechanism for modbus master protocol stack.
-     * If you don't use OS, you can change it.
-     */
-    if (bMBPortIsWithinException () == TRUE) {
-    	chMBPostI (&xQueueHdl, EV_MASTER_ERROR_RECEIVE_DATA);
-    } else {
-    	chMBPost (&xQueueHdl, EV_MASTER_ERROR_RECEIVE_DATA, TIME_IMMEDIATE);
-    }
-
-    /* You can add your code under here. */
-
-}
-
-/**
- * This is modbus master execute function error process callback function.
- * @note There functions will block modbus master poll while execute OS waiting.
- * So,for real-time of system.Do not execute too much waiting process.
- *
- * @param ucDestAddress destination salve address
- * @param pucPDUData PDU buffer data
- * @param ucPDULength PDU buffer length
- *
- */
-void vMBMasterErrorCBExecuteFunction(UCHAR ucDestAddress, const UCHAR* pucPDUData,
-        USHORT ucPDULength) {
-    (void)ucDestAddress;
-    (void)pucPDUData;
-    (void)ucPDULength;
-    /**
-     * @note This code is use OS's event mechanism for modbus master protocol stack.
-     * If you don't use OS, you can change it.
-     */
-    if (bMBPortIsWithinException () == TRUE) {
-    	chMBPostI (&xQueueHdl, EV_MASTER_ERROR_EXECUTE_FUNCTION);
-    } else {
-    	chMBPost (&xQueueHdl, EV_MASTER_ERROR_EXECUTE_FUNCTION, TIME_IMMEDIATE);
-    }
-
-    /* You can add your code under here. */
-
-}
-
-/**
- * This is modbus master request process success callback function.
- * @note There functions will block modbus master poll while execute OS waiting.
- * So,for real-time of system.Do not execute too much waiting process.
- *
- */
-void vMBMasterCBRequestSuccess( void ) {
-    /**
-     * @note This code is use OS's event mechanism for modbus master protocol stack.
-     * If you don't use OS, you can change it.
-     */
-    if (bMBPortIsWithinException () == TRUE) {
-    	chMBPostI (&xQueueHdl, EV_MASTER_PROCESS_SUCCESS);
-    } else {
-    	chMBPost (&xQueueHdl, EV_MASTER_PROCESS_SUCCESS, TIME_IMMEDIATE);
-    }
-
-    /* You can add your code under here. */
-
-}
-
-/**
- * This function is wait for modbus master request finish and return result.
- * Waiting result include request process success, request respond timeout,
- * receive data error and execute function error.You can use the above callback function.
- * @note If you are use OS, you can use OS's event mechanism. Otherwise you have to run
- * much user custom delay for waiting.
- *
- * @return request error code
- */
-eMBMasterReqErrCode eMBMasterWaitRequestFinish( void ) {
-    eMBMasterReqErrCode    eErrStatus = MB_MRE_NO_ERR;
-    msg_t recvedEvent;
-    /* waiting for OS event */
-#if 0
-    do {
-    	chMBFetch (&xQueueHdl, &recvedEvent, TIME_INFINITE);
-    	if (recvedEvent < EV_MASTER_ERROR_PROCESS)
-    		chMBPost(&xQueueHdl, recvedEvent, TIME_IMMEDIATE);
-    	else
-    		break;
-    } while ( 1 );
-#endif
-
-    switch (recvedEvent)
-    {
-    case EV_MASTER_ERROR_PROCESS:
-        eErrStatus = MB_MRE_TIMEDOUT;
-        break;
-    case EV_MASTER_PROCESS_SUCCESS:
-        break;
-    case EV_MASTER_ERROR_RESPOND_TIMEOUT:
-    {
-        eErrStatus = MB_MRE_TIMEDOUT;
-        break;
-    }
-    case EV_MASTER_ERROR_RECEIVE_DATA:
-    {
-        eErrStatus = MB_MRE_REV_DATA;
-        break;
-    }
-    case EV_MASTER_ERROR_EXECUTE_FUNCTION:
-    {
-        eErrStatus = MB_MRE_EXE_FUN;
-        break;
-    }
-    }
-    vMBMasterRunResRelease ();
-
-    return eErrStatus;
-}
-
-#elif MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
+#if MB_SLAVE_RTU_ENABLED > 0 || MB_SLAVE_ASCII_ENABLED > 0
 
 BOOL
 xMBPortEventInit( void )
 {
-  chMBInit(&xQueueHdl, &bufferQueue, 1);
+  chMBObjectInit(&xQueueHdl, &bufferQueue, 1);
 
   return TRUE;
 }
@@ -304,12 +62,12 @@ xMBPortEventPost( eMBEventType eEvent )
 
   if (bMBPortIsWithinException () == TRUE) {
     
-    if (chMBPostI (&xQueueHdl, (msg_t) eEvent) != RDY_OK)
+    if (chMBPostI (&xQueueHdl, (msg_t) eEvent) != MSG_OK)
       bStatus = FALSE;
     
   } else {
     
-    if (chMBPost (&xQueueHdl, (msg_t) eEvent, TIME_INFINITE) != RDY_OK)
+    if (chMBPost (&xQueueHdl, (msg_t) eEvent, TIME_INFINITE) != MSG_OK)
       bStatus = FALSE;
   }
 
@@ -321,7 +79,7 @@ xMBPortEventGet( eMBEventType * peEvent )
 {
     BOOL            xEventHappened = FALSE;
 
-    if(chMBFetch (&xQueueHdl, (msg_t *) peEvent, MS2ST (50)) == RDY_OK)
+    if(chMBFetch (&xQueueHdl, (msg_t *) peEvent, MS2ST (50)) == MSG_OK)
       xEventHappened = TRUE;
 
     return xEventHappened;

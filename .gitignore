@@ -2,9 +2,5 @@
 .settings
 .cproject
 .project
-build/lst
-build/obj
-build/rserver.hex
-build/rserver.dmp
-build/rserver.map
+build
 aes_secret.h

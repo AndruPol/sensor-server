@@ -4,7 +4,7 @@
 * See stdlib.h for licence.                            *
 * $Date: 2005/08/31 11:39:47 $                         *
 *******************************************************/
-#include <stdlib.h>
+//#include <stdlib.h>
 
 char *utoa(unsigned long num, char *str, int radix) {
     char temp[33];  //an int can only be 16 bits long

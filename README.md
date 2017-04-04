@@ -1,11 +1,17 @@
 
-# Шлюз приема данных с удаленных датчиков на nRF24LE1 (nRF24LE1-sensor) на базе ChibiOS 2.6.8 or later
+# Шлюз приема/передачи данных с удаленных модулей nRF24LXX (nRF24LE1-sensor, др.) на базе ChibiOS 3.x.x or later
 
-- опрос удаленных датчиков nRF24LE1
+- прием с удаленных датчиков nRF24LXX
 
-- опрос датчика BMP085
+- опрос внутреннего датчика BMP085
 
-- передача показаний датчиков на ПК по протоколу Modbus RTU через RS485
+- передача показаний на ПК по протоколу Modbus RTU через RS485
+
+- I2C EEPROM для хранения настроек шлюза
+
+- IWDG строжевой таймер
+
+- AES128 ECB шифрование данных
 
 
 ## Custom gateway board on MCU STM32F103C8Tx
@@ -13,12 +19,12 @@
 
 PERIPHERALS	MODES	FUNCTIONS	PINS
 
-подключение BMP085 
+подключение EEPROM, BMP085 
 
-- I2C1	I2C	I2C1_SCL	PB6
-- I2C1	I2C	I2C1_SDA	PB7
+- I2C2	I2C	I2C2_SCL	PB10
+- I2C2	I2C	I2C2_SDA	PB11
 
-связь с удаленными датчиками nRF24L01
+связь с удаленными модулями nRF24LXX
 
 - SPI1	Full-Duplex Master	SPI1_MISO	PA6
 - SPI1	Full-Duplex Master	SPI1_MOSI	PA7
@@ -33,9 +39,9 @@ SWD
 
 Modbus через RS485
 
-- TIM2	Internal Clock	TIM2_VS_ClockSourceINT	VP_TIM2_VS_ClockSourceINT
-- USART1	Asynchronous	USART1_RX	PA10
-- USART1	Asynchronous	USART1_TX	PA9
+- TIM4	Internal Clock	TIM4_VS_ClockSourceINT	VP_TIM4_VS_ClockSourceINT
+- USART2	Asynchronous	USART2_RX	PA3
+- USART2	Asynchronous	USART2_TX	PA2
 
 Pin Nb	PINs	FUNCTIONs	LABELs
 
@@ -55,8 +61,8 @@ cветодиод работы
 Modbus через RS485
 
 - 29	PA8	GPIO_Output	MODBAS_TX_EN
-- 30	PA9	USART1_TX	MODBAS_TX
-- 31	PA10	USART1_RX	MODBAS_RX
+- 12	PA2	USART2_TX	MODBAS_TX
+- 13	PA3	USART2_RX	MODBAS_RX
 
 SWD 
 
@@ -64,7 +70,7 @@ SWD
 - 37	PA14	SYS_JTCK-SWCLK	
 - 39	PB3	SYS_JTDO-TRACESWO	
 
-подключение BMP085
+подключение BMP085, EEPROM AT24C32
 
-- 42	PB6	I2C1_SCL	BMP085_SCL
-- 43	PB7	I2C1_SDA	BMP085_SDA
+- 21	PB10	I2C1_SCL	SCL
+- 22	PB11	I2C1_SDA	SDA
